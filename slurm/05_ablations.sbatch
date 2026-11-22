@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --nodes=1
-#SBATCH --partition=n2d32p
+#SBATCH --partition=n2c48m24
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=22G
 #SBATCH --time=04:00:00
 #SBATCH --job-name=jepa_05_ablations
 #SBATCH --output=slurm/logs/%x_%j.out
