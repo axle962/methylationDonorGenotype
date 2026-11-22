@@ -3,7 +3,7 @@
   python scripts/06_covariates.py [--encodings outputs/encodings] [--pred outputs/predictor] [--out outputs/experiments/covariates]
 
 Per block (all blocks and dimensions in one multi-output least-squares fit over the test samples):
-  M1 tissue + sex + age   M2 + plate   M3 + sentrix_id   M4 = M3, then PEER1-20 within each tissue
+  M1 tissue + sex + age + smoking   M2 + plate   M3 + sentrix_id   M4 = M3, then PEER1-20 within each tissue
 PEER factors are per tissue (data/egtex/metadata/<Tissue>.covariates.txt, aligned by donor), so M4 fits them
 within tissue; a tissue with too few test samples for 20 PEERs keeps its M3 values and is reported.
 Genotype PCs are deliberately NOT regressed: they are the donor-genotype signal being tested.
@@ -28,8 +28,11 @@ p.add_argument("--pred", default="outputs/predictor")
 p.add_argument("--egtex-dir", default="data/egtex")
 p.add_argument("--out", default="outputs/experiments/covariates")
 p.add_argument("--kind", default="mlp_joint", help="predictor kind (primary: mlp_joint, docs/PREREG.md)")
+p.add_argument("--n-perm", type=int, default=10_000, help="permutations vs chance for rung 3 (smoke: 200)")
 p.add_argument("--smoke", action="store_true")
 args = p.parse_args()
+if args.smoke:
+    args.n_perm = min(args.n_perm, 200)
 t0 = time.time()
 
 run = load_run(args.enc, args.pred, args.egtex_dir)
@@ -43,12 +46,13 @@ covs = {
     "tissue": one_hot(meta.tissue.to_numpy()),
     "sex": numeric(meta.sex.to_numpy()),
     "age": numeric(meta.age_years.to_numpy()),
+    "smoking": one_hot(meta.smoker_status.fillna("NA").to_numpy()),  # docs/PREREG.md rung 3
     "plate": one_hot(meta.plate.to_numpy()),
     "sentrix_id": one_hot(meta.sentrix_id.to_numpy()),
 }
-models = {"M1 tissue+sex+age": ["tissue", "sex", "age"],
-          "M2 +plate": ["tissue", "sex", "age", "plate"],
-          "M3 +sentrix_id": ["tissue", "sex", "age", "plate", "sentrix_id"]}
+models = {"M1 tissue+sex+age+smoking": ["tissue", "sex", "age", "smoking"],
+          "M2 +plate": ["tissue", "sex", "age", "smoking", "plate"],
+          "M3 +sentrix_id": ["tissue", "sex", "age", "smoking", "plate", "sentrix_id"]}
 print(f"test samples {len(test)}; columns: " + ", ".join(f"{k} {v.shape[1]}" for k, v in covs.items()))
 
 
@@ -74,7 +78,7 @@ def clean_and_match(rep: np.ndarray) -> tuple[dict, dict]:
     """rep: samples x blocks x d. Donor matching before and after each covariate model."""
     Y = rep[test][:, run.auto_blocks].reshape(len(test), -1).astype(np.float64)
     full = np.zeros((n_samples, Y.shape[1]))
-    res = {"before": donor_matching(run, rep)}
+    res = {"before": donor_matching(run, rep, n_perm=args.n_perm)}
     cleaned = Y
     for name, cols in models.items():
         cleaned = residualise(Y, np.column_stack([covs[c] for c in cols]))
@@ -82,7 +86,8 @@ def clean_and_match(rep: np.ndarray) -> tuple[dict, dict]:
         res[name] = donor_matching(run, full.copy())
     cleaned, peer_status = peer_within_tissue(cleaned)
     full[test] = cleaned
-    res["M4 +PEER within tissue"] = donor_matching(run, full.copy())
+    # M4 = every covariate of docs/PREREG.md rung 3; it carries the permutation test against chance
+    res["M4 +PEER within tissue"] = donor_matching(run, full.copy(), n_perm=args.n_perm)
     return res, peer_status
 
 
