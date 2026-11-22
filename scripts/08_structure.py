@@ -31,7 +31,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from cpgpt_jepa import finish  # noqa: E402
 from cpgpt_jepa.evaluation import donor_matching, fmt, load_run, write_outputs  # noqa: E402
-from cpgpt_jepa.predictor import load_predictor, standardise_descriptors  # noqa: E402
+from cpgpt_jepa.predictor import is_joint, load_predictor, standardise_descriptors  # noqa: E402
 from cpgpt_jepa.structure import (  # noqa: E402
     ANNOT_DIR,
     block_profile,
@@ -50,7 +50,7 @@ p.add_argument("--pred", default="outputs/predictor")
 p.add_argument("--egtex-dir", default="data/egtex")
 p.add_argument("--metadata", default="data/egtex/metadata.csv")
 p.add_argument("--out", default="outputs/experiments/structure")
-p.add_argument("--kind", default="mlp")
+p.add_argument("--kind", default="mlp_joint", help="predictor kind (primary: mlp_joint, docs/PREREG.md)")
 p.add_argument("--cell-type", default="IMR-90", help="ENCODE biosample for the compartment track")
 p.add_argument("--annotation", default=None, help="annotation name under data/3d/annotations (default: cell type)")
 p.add_argument("--hic-url", default="https://www.encodeproject.org/files/ENCFF916GWS/@@download/ENCFF916GWS.hic",
@@ -127,7 +127,9 @@ E = np.full((n_blocks, n_blocks), np.nan)
 with torch.no_grad():
     for b in auto:
         srcs = auto[codes[auto] != codes[b]]
-        pred = model(Zs[:, srcs], Cn[b].expand(len(samples), len(srcs), -1),
+        # E[a, b] is the one-source error; a joint (deep-sets) model gets each source as a set of K = 1
+        z_a = Zs[:, srcs].unsqueeze(-2) if is_joint(model) else Zs[:, srcs]
+        pred = model(z_a, Cn[b].expand(len(samples), len(srcs), -1),
                      torch.full((len(samples), len(srcs)), int(b)))
         E[srcs, b] = ((pred - Zs[:, b : b + 1]) ** 2).mean((0, 2)).numpy()
 np.save(out / "pair_error.npy", E)
@@ -173,14 +175,14 @@ profile = np.column_stack([np.nan_to_num(prof["a_fraction"], nan=np.nanmean(prof
                            np.nan_to_num(prof["mean_value"], nan=0.0)])
 np.savez(out / "struct_profile.npz", profile=profile)
 cmd = [sys.executable, "scripts/03_train_predictor.py", "--enc", str(run.enc), "--out", str(run.pred),
-       "--metadata", args.metadata, "--kinds", "mlp", "--struct", str(out / "struct_profile.npz"),
-       "--tag", "mlp_struct", "--allow-cpu"] + (["--smoke"] if args.smoke else [])
+       "--metadata", args.metadata, "--kinds", args.kind, "--struct", str(out / "struct_profile.npz"),
+       "--tag", f"{args.kind}_struct", "--allow-cpu"] + (["--smoke"] if args.smoke else [])
 env = {k: v for k, v in os.environ.items() if k != "SANITY_FILE"}
-log("[4] training mlp_struct: " + " ".join(cmd))
+log(f"[4] training {args.kind}_struct: " + " ".join(cmd))
 subprocess.run(cmd, check=True, cwd=REPO, env=env)
 metrics = json.loads((run.pred / "metrics.json").read_text())
 result["mlp_struct"] = {}
-for kind in ("mlp", "mlp_struct"):
+for kind in (args.kind, f"{args.kind}_struct"):
     result["mlp_struct"][kind] = {"donor_matching": donor_matching(run, run.residual(kind)),
                                   "test_mse_train_blocks": metrics[kind]["train_blocks"]["test_mse"],
                                   "test_mse_heldout_blocks": metrics[kind].get("heldout_blocks", {}).get("test_mse")}

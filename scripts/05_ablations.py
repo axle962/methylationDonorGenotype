@@ -45,7 +45,7 @@ p.add_argument("--encodings", "--enc", dest="enc", default="outputs/encodings")
 p.add_argument("--pred", default="outputs/predictor")
 p.add_argument("--egtex-dir", default="data/egtex")
 p.add_argument("--out", default="outputs/experiments/ablations")
-p.add_argument("--kind", default="mlp")
+p.add_argument("--kind", default="mlp_joint", help="predictor kind (primary: mlp_joint, docs/PREREG.md)")
 p.add_argument("--ks", default="1,4,8,32")
 p.add_argument("--sizes-mb", default="5,10,20")
 p.add_argument("--size-encodings", default="outputs/encodings_{mb}mb", help="pattern for the other block sizes")
@@ -115,8 +115,8 @@ for mb in (int(x) for x in args.sizes_mb.split(",")):
     z_tr = Z_b[tr_s][:, auto_b].reshape(-1, Z_b.shape[2])
     Zs_b = torch.from_numpy((Z_b - z_tr.mean(0)) / z_tr.std(0)).float()
     Cn_b = torch.from_numpy(standardise_descriptors(np.load(enc_dir / "C.npy")))
-    model_b, _ = train_predictor("mlp", Zs_b, Cn_b, tr_s, np.array(sp["train_blocks"]), codes_b, auto_b,
-                                 seed=args.seed, log=lambda msg: None)
+    model_b, _ = train_predictor(args.kind, Zs_b, Cn_b, tr_s, np.array(sp["train_blocks"]), codes_b, auto_b,
+                                 seed=args.seed, k_sources=8, log=lambda msg: None)
     P_b, _ = predict(model_b, Zs_b, Cn_b, fixed_sources(codes_b, 8, args.seed, pool=auto_b))
     R_b = (Zs_b - P_b).numpy()[:, auto_b]
     m = donor_matching(run, R_b, blocks=np.arange(R_b.shape[1]))

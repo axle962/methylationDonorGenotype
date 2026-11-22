@@ -7,7 +7,11 @@ import numpy as np
 import torch
 from torch import nn
 
-KINDS = ("mlp", "linear", "block_mean")
+# Joint kinds see all K source blocks at once (one prediction per target, so the residual is exactly
+# orthogonal to what f can compute from those sources); pairwise kinds average K one-source predictions.
+# Joint kinds come first so that base_kind matches "mlp_joint_struct" to "mlp_joint", not "mlp".
+KINDS = ("mlp_joint", "linear_joint", "mlp", "linear", "block_mean")
+PRIMARY_KIND = "mlp_joint"  # docs/PREREG.md section 1
 
 
 class MLPPredictor(nn.Module):
@@ -37,6 +41,45 @@ class LinearPredictor(nn.Module):
         return self.net(torch.cat([z_a, c_b], dim=-1))
 
 
+class JointMLPPredictor(nn.Module):
+    """Deep-sets predictor over K source blocks: mean_k phi(z_Ak), concatenated with c_B, then a 3-layer
+    MLP (hidden 1024, GELU, dropout 0.1). Invariant to source order and usable with any K."""
+
+    joint = True
+
+    def __init__(self, d: int, d_c: int | None = None, d_set: int = 512, hidden: int = 1024,
+                 dropout: float = 0.1) -> None:
+        super().__init__()
+        d_c = d if d_c is None else d_c
+        self.phi = nn.Sequential(nn.Linear(d, d_set), nn.GELU(), nn.Linear(d_set, d_set))
+        self.rho = nn.Sequential(
+            nn.Linear(d_set + d_c, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, d),
+        )
+
+    def forward(self, z_a: torch.Tensor, c_b: torch.Tensor, block_b: torch.Tensor) -> torch.Tensor:
+        """z_a: (..., K, d); c_b: (..., d_c) -> (..., d)."""
+        return self.rho(torch.cat([self.phi(z_a).mean(-2), c_b], dim=-1))
+
+
+class JointLinearPredictor(nn.Module):
+    """Linear baseline for the joint kinds: concat(mean_k z_Ak, c_B) -> one linear layer."""
+
+    joint = True
+
+    def __init__(self, d: int, d_c: int | None = None) -> None:
+        super().__init__()
+        self.net = nn.Linear(d + (d if d_c is None else d_c), d)
+
+    def forward(self, z_a: torch.Tensor, c_b: torch.Tensor, block_b: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([z_a.mean(-2), c_b], dim=-1))
+
+
+def is_joint(model: nn.Module) -> bool:
+    return bool(getattr(model, "joint", False))
+
+
 class BlockMeanPredictor(nn.Module):
     """Ignores z_A: the train-sample mean of z_B. A block that is never a training target has no
     training targets, so it gets the mean over the train blocks instead."""
@@ -60,6 +103,10 @@ def base_kind(kind: str) -> str:
 
 def make_predictor(kind: str, d: int, d_c: int, z_train: torch.Tensor, train_blocks: torch.Tensor) -> nn.Module:
     kind = base_kind(kind)
+    if kind == "mlp_joint":
+        return JointMLPPredictor(d, d_c)
+    if kind == "linear_joint":
+        return JointLinearPredictor(d, d_c)
     if kind == "mlp":
         return MLPPredictor(d, d_c)
     if kind == "linear":
@@ -132,10 +179,12 @@ def standardise_descriptors(C: np.ndarray, extra: np.ndarray | None = None) -> n
 def train_predictor(kind: str, Zs: torch.Tensor, Cn: torch.Tensor, train_s: np.ndarray, train_b: np.ndarray,
                     block_chrom: np.ndarray, source_pool: np.ndarray, *, epochs: int = 20,
                     pairs_per_sample: int = 64, batch_size: int = 1024, lr: float = 3e-4,
-                    weight_decay: float = 1e-4, seed: int = 0,
+                    weight_decay: float = 1e-4, seed: int = 0, k_sources: int = 8,
                     log: Callable[[str], None] = print) -> tuple[nn.Module, list[float]]:
     """Train f on (sample s, source A, target B): chrom(A) != chrom(B), B a train block, s a train
-    sample, `pairs_per_sample` fresh pairs per sample per epoch, MSE in standardised space."""
+    sample, `pairs_per_sample` fresh pairs per sample per epoch, MSE in standardised space.
+    Joint kinds draw a fresh set of `k_sources` sources per pair (random sets, so the deep-sets model
+    learns to pool any K; evaluation uses the fixed sources from fixed_sources)."""
     device = Zs.device
     torch.manual_seed(seed)
     gen = torch.Generator(device=device).manual_seed(seed)
@@ -149,16 +198,21 @@ def train_predictor(kind: str, Zs: torch.Tensor, Cn: torch.Tensor, train_s: np.n
         return model, train_log
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     n_examples = len(train_s) * pairs_per_sample
+    joint = is_joint(model)
     for epoch in range(epochs):
         model.train()
         s = train_s_t.repeat_interleave(pairs_per_sample)
         tgt = train_b_t[torch.randint(len(train_b), (n_examples,), generator=gen, device=device)]
-        src = sample_sources(tgt, chrom_t, pool_t, gen)
+        if joint:  # (n_examples, K) sources, each on a different chromosome from its target
+            src = sample_sources(tgt[:, None].expand(-1, k_sources).contiguous(), chrom_t, pool_t, gen)
+        else:
+            src = sample_sources(tgt, chrom_t, pool_t, gen)
         perm = torch.randperm(n_examples, generator=gen, device=device)
         total = 0.0
         for i in range(0, n_examples, batch_size):
             idx = perm[i : i + batch_size]
-            pred = model(Zs[s[idx], src[idx]], Cn[tgt[idx]], tgt[idx])
+            z_a = Zs[s[idx, None], src[idx]] if joint else Zs[s[idx], src[idx]]
+            pred = model(z_a, Cn[tgt[idx]], tgt[idx])
             loss = nn.functional.mse_loss(pred, Zs[s[idx], tgt[idx]])
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -172,8 +226,9 @@ def train_predictor(kind: str, Zs: torch.Tensor, Cn: torch.Tensor, train_s: np.n
 @torch.no_grad()
 def predict(model: nn.Module, Zs: torch.Tensor, Cn: torch.Tensor, sources: np.ndarray,
             targets: np.ndarray | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """For every sample and target block: P = mean over that block's fixed sources of f(z_A, c_B),
-    and the per-pair squared error averaged over sources and dimensions. Returns (P, pair_mse)."""
+    """For every sample and target block: P = f over that block's fixed sources, and the squared error
+    averaged over dimensions (and, for pairwise kinds, over sources). Pairwise kinds average K
+    one-source predictions; joint kinds make one prediction from all K. Returns (P, pair_mse)."""
     model.eval()
     n, n_blocks, d = Zs.shape
     targets = np.arange(n_blocks) if targets is None else targets
@@ -181,7 +236,13 @@ def predict(model: nn.Module, Zs: torch.Tensor, Cn: torch.Tensor, sources: np.nd
     k = src.size(1)
     P = torch.zeros_like(Zs)
     pair_mse = torch.full((n, n_blocks), float("nan"), device=Zs.device)
+    joint = is_joint(model)
     for b in targets:
+        if joint:
+            pred = model(Zs[:, src[b]], Cn[b].expand(n, -1), torch.full((n,), int(b), device=Zs.device))
+            P[:, b] = pred
+            pair_mse[:, b] = ((pred - Zs[:, b]) ** 2).mean(1)
+            continue
         pred = model(Zs[:, src[b]], Cn[b].expand(n, k, -1), torch.full((n, k), int(b), device=Zs.device))
         P[:, b] = pred.mean(1)
         pair_mse[:, b] = ((pred - Zs[:, b : b + 1]) ** 2).mean((1, 2))
