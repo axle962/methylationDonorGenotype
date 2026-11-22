@@ -115,10 +115,17 @@ def load_run(enc: str | Path, pred: str | Path, egtex_dir: str | Path) -> Run:
 
 
 # --- donor matching ------------------------------------------------------------------------------
-def retrieval(rep: np.ndarray, donor: np.ndarray, query_idx: np.ndarray, gallery_idx: np.ndarray) -> dict:
-    """Cosine retrieval of the same donor's sample among gallery samples. rep: samples x features."""
+def retrieval(rep: np.ndarray, donor: np.ndarray, query_idx: np.ndarray, gallery_idx: np.ndarray,
+              n_perm: int = 0, seed: int = 0) -> dict:
+    """Cosine retrieval of the same donor's sample among gallery samples. rep: samples x features.
+
+    The result keeps each query's rank and donor ("ranks", "query_donor"), so two representations can
+    be compared query by query with paired_bootstrap. With n_perm > 0 it adds "perm_p_top1", a one-sided
+    permutation p-value against chance: gallery donor labels are shuffled n_perm times and top-1
+    recomputed on the same similarity matrix (docs/PREREG.md section 2)."""
     nan = {"top1": float("nan"), "top5": float("nan"), "mrr": float("nan"),
-           "chance": 1 / max(len(gallery_idx), 1), "n_query": 0, "n_gallery": len(gallery_idx)}
+           "chance": 1 / max(len(gallery_idx), 1), "n_query": 0, "n_gallery": len(gallery_idx),
+           "ranks": [], "query_donor": []}
     gallery_donors = set(donor[gallery_idx])
     query_idx = np.array([i for i in query_idx if donor[i] in gallery_donors], dtype=int)
     if len(query_idx) == 0 or len(gallery_idx) == 0:
@@ -126,7 +133,36 @@ def retrieval(rep: np.ndarray, donor: np.ndarray, query_idx: np.ndarray, gallery
     q, g = rep[query_idx].astype(np.float64), rep[gallery_idx].astype(np.float64)
     q /= np.linalg.norm(q, axis=1, keepdims=True) + 1e-12
     g /= np.linalg.norm(g, axis=1, keepdims=True) + 1e-12
-    return ranks_to_metrics(rank_of_true(q @ g.T, donor[query_idx], donor[gallery_idx]), len(gallery_idx))
+    sim, q_donor, g_donor = q @ g.T, donor[query_idx], donor[gallery_idx]
+    rank = rank_of_true(sim, q_donor, g_donor)
+    out = {**ranks_to_metrics(rank, len(gallery_idx)), "ranks": rank.tolist(), "query_donor": q_donor.tolist()}
+    if n_perm > 0:
+        rng = np.random.default_rng(seed)
+        obs = int((rank <= 1).sum())
+        hits = sum(int((rank_of_true(sim, q_donor, rng.permutation(g_donor)) <= 1).sum()) >= obs
+                   for _ in range(n_perm))
+        out["perm_p_top1"] = (1 + hits) / (1 + n_perm)
+        out["n_perm"] = n_perm
+    return out
+
+
+def paired_bootstrap(a: dict, b: dict, n_boot: int = 10_000, seed: int = 0, metric: str = "top1") -> dict:
+    """Difference a - b in top-1 (or MRR) between two retrieval results over the same queries, with a
+    95% percentile CI from resampling query donors (docs/PREREG.md section 2). Queries are aligned by
+    donor; only donors present in both enter."""
+    ra = dict(zip(a.get("query_donor", []), a.get("ranks", [])))
+    rb = dict(zip(b.get("query_donor", []), b.get("ranks", [])))
+    shared = sorted(set(ra) & set(rb))
+    if not shared:
+        return {"metric": metric, "diff": float("nan"), "ci95": [float("nan"), float("nan")], "n_query": 0}
+    xa, xb = np.array([ra[d] for d in shared], float), np.array([rb[d] for d in shared], float)
+    score = (lambda r: (r <= 1).astype(float)) if metric == "top1" else (lambda r: 1 / r)
+    delta = score(xa) - score(xb)
+    idx = np.random.default_rng(seed).integers(0, len(delta), size=(n_boot, len(delta)))
+    boot = delta[idx].mean(1)
+    lo, hi = np.percentile(boot, [2.5, 97.5])
+    return {"metric": metric, "diff": float(delta.mean()), "ci95": [float(lo), float(hi)],
+            "significant": bool(lo > 0 or hi < 0), "n_query": len(shared), "n_boot": n_boot}
 
 
 def rank_of_true(sim: np.ndarray, query_donor: np.ndarray, gallery_donor: np.ndarray) -> np.ndarray:
@@ -151,15 +187,16 @@ def lung_colon_sets(run: Run) -> dict[str, np.ndarray]:
             "lung_q": lung[np.isin(run.donor[lung], both)], "colon_q": colon[np.isin(run.donor[colon], both)]}
 
 
-def donor_matching(run: Run, rep: np.ndarray, blocks: np.ndarray | None = None) -> dict:
+def donor_matching(run: Run, rep: np.ndarray, blocks: np.ndarray | None = None, n_perm: int = 0,
+                   seed: int = 0) -> dict:
     """Lung->colon and colon->lung matching. rep is samples x blocks x d (flattened over `blocks`,
     default the autosomal blocks) or samples x features."""
     if rep.ndim == 3:
         rep = rep[:, run.auto_blocks if blocks is None else blocks]
     rep = rep.reshape(len(rep), -1)
     s = lung_colon_sets(run)
-    return {"lung_to_colon": retrieval(rep, run.donor, s["lung_q"], s["colon"]),
-            "colon_to_lung": retrieval(rep, run.donor, s["colon_q"], s["lung"])}
+    return {"lung_to_colon": retrieval(rep, run.donor, s["lung_q"], s["colon"], n_perm, seed),
+            "colon_to_lung": retrieval(rep, run.donor, s["colon_q"], s["lung"], n_perm, seed)}
 
 
 def tissue_centred(run: Run, Zs: np.ndarray) -> np.ndarray:
