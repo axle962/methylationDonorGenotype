@@ -32,6 +32,7 @@ from cpgpt_jepa.evaluation import (  # noqa: E402
     percentile_within_block,
     read_set,
     site_scores,
+    tested_cpgs,
     tissue_centred,
 )
 
@@ -66,6 +67,40 @@ if run.Z_full is not None:
 DIRS = ("lung_to_colon", "colon_to_lung")
 
 
+def raw_beta_reps() -> dict:
+    """Ceiling comparator (docs/PREREG.md section 3): matching on the betas of the same autosomal block
+    sites. Rows: lung and colon samples (test ones are matched; train ones give the tissue means).
+    Missing betas take the train lung/colon column mean. Context only: no decision rule uses it."""
+    if run.W_block is None or "dataset_dir" not in run.enc_meta:
+        return {}
+    from cpgpt_jepa.blocks import open_processed
+
+    X_mm, _, _, _ = open_processed(Path(run.enc_meta["dataset_dir"]))
+    sample_rows = np.array(run.enc_meta.get("sample_idx", np.arange(X_mm.shape[0])))
+    cols = np.unique(np.load(run.enc / "W_index.npy")[np.isin(run.W_block, run.auto_blocks), 0])
+    lc = np.flatnonzero(np.isin(run.tissue, [LUNG, COLON]))
+    X = np.asarray(X_mm[np.sort(sample_rows[lc])])
+    order = np.argsort(np.argsort(sample_rows[lc]))  # back to lc order
+    X = X[order][:, cols]
+    tr = np.isin(lc, run.train_s)
+    col_mean = np.nanmean(X[tr], axis=0) if tr.any() else np.nanmean(X, axis=0)
+    X = np.where(np.isnan(X), col_mean, X)
+    full = np.zeros((n_samples, X.shape[1]), dtype=np.float32)
+    full[lc] = X
+    out = {"raw betas (same sites)": donor_matching(run, full)}
+    for t in (LUNG, COLON):
+        ref = lc[tr & (run.tissue[lc] == t)]
+        mean = X[np.isin(lc, ref)].mean(0) if len(ref) else X[run.tissue[lc] == t].mean(0)
+        full[lc[run.tissue[lc] == t]] -= mean
+    out["raw betas - tissue mean"] = donor_matching(run, full)
+    print(f"raw-beta ceiling on {len(cols)} sites, {len(lc)} lung/colon samples ({time.time() - t0:.0f}s)", flush=True)
+    return out
+
+
+if not args.beta_space:
+    shared_reps.update(raw_beta_reps())
+
+
 def compare(a: dict, b: dict) -> dict:
     """Paired bootstrap a - b in top-1, per direction (docs/PREREG.md section 2)."""
     return {d: paired_bootstrap(a[d], b[d], n_boot=args.n_boot) for d in DIRS}
@@ -95,9 +130,12 @@ sample_sets = {"all": run.test_s,
                "Lung": np.flatnonzero(run.is_test & (run.tissue == LUNG)),
                "ColonTransverse": np.flatnonzero(run.is_test & (run.tissue == COLON))}
 has_w = run.W is not None
-membership = {}
+membership, tested = {}, {}
 if has_w:
     membership = {name: np.isin(run.site_probes, sorted(ids)) for name, ids in mqtl_lists.items()}
+    # docs/PREREG.md section 4: background = CpGs tested in that list's mQTL table(s), not significant
+    tested = {name: np.isin(run.site_probes, sorted(tested_cpgs(egtex, None if name == "any" else [name])))
+              for name in mqtl_lists}
 
 results = {}
 for kind in kinds:
@@ -124,9 +162,12 @@ for kind in kinds:
             for list_name, is_mqtl in membership.items():
                 if set_name not in ("all", list_name):
                     continue
+                bg = tested[list_name][rows]  # tested sites only (an mQTL CpG is always tested)
                 res["mqtl"][f"{list_name} list / {set_name} test samples"] = {
-                    "n_samples": len(samples), "variance": enrichment(pct_var, is_mqtl[rows]),
-                    "mean_abs": enrichment(pct_abs, is_mqtl[rows])}
+                    "n_samples": len(samples), "background": "CpGs tested in the mQTL table(s)",
+                    "variance": enrichment(pct_var[bg], is_mqtl[rows][bg]),
+                    "mean_abs": enrichment(pct_abs[bg], is_mqtl[rows][bg]),
+                    "variance_all_sites_background": enrichment(pct_var, is_mqtl[rows])}
     else:
         res["mqtl"] = "skipped: these encodings have no per-site decoder vectors (W.mmap)"
     (run.pred / kind / "evaluation.json").write_text(json.dumps(res, indent=2))
@@ -176,7 +217,8 @@ for kind in kinds:
 
 if has_w:
     print("\nB. mQTL enrichment of the residual's per-site score (variance of g over samples), percentile within block.")
-    print("   pct = mean percentile (mQTL / other sites); MW p = one-sided Mann-Whitney; OR, Fisher p = mQTL in the top 5%.")
+    print("   pct = mean percentile (mQTL / other tested sites); MW p = one-sided Mann-Whitney; OR [95% CI], Fisher p = mQTL in the top 5%.")
+    print("   Background: CpGs tested in the eGTEx mQTL table(s) and not significant (docs/PREREG.md section 4).")
     print(f"{'kind':<12s}{'mQTL list / test samples':<34s}{'n':>5s}{'pct mQTL':>10s}{'pct other':>10s}"
           f"{'MW p':>10s}{'OR top5%':>10s}{'Fisher p':>10s}")
     for kind in kinds:
@@ -184,10 +226,12 @@ if has_w:
             v = m["variance"]
             print(f"{kind:<12s}{name:<34s}{m['n_samples']:>5d}{fmt(v['mean_pct_set'], '.4f'):>10s}"
                   f"{fmt(v['mean_pct_other'], '.4f'):>10s}{fmt(v['mannwhitney_p'], '.2e'):>10s}"
-                  f"{fmt(v['top5_odds_ratio']):>10s}{fmt(v['top5_fisher_p'], '.2e'):>10s}")
+                  f"{fmt(v['top5_odds_ratio']):>10s}{fmt(v['top5_fisher_p'], '.2e'):>10s}"
+                  f"  [{fmt(v.get('top5_or_ci95', [np.nan] * 2)[0])}, {fmt(v.get('top5_or_ci95', [np.nan] * 2)[1])}]")
     print("   (secondary score, mean |g|, is in each evaluation.json)")
     print(f"   sites in blocks: {len(run.site_probes)}; in mQTL lists: "
-          + ", ".join(f"{k} {int(v.sum())}" for k, v in membership.items()))
+          + ", ".join(f"{k} {int(v.sum())}" for k, v in membership.items())
+          + "; tested: " + ", ".join(f"{k} {int(v.sum())}" for k, v in tested.items()))
 else:
     print("\nB. mQTL enrichment skipped: no per-site decoder vectors (W.mmap) in these encodings.")
 print(f"elapsed: {time.time() - t0:.0f}s")

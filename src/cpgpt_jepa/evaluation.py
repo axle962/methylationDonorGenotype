@@ -253,9 +253,26 @@ def enrichment(pct: np.ndarray, is_set: np.ndarray, top: float = 0.95) -> dict:
     table = [[int((hi & is_set).sum()), int((hi & ~is_set).sum())],
              [int((~hi & is_set).sum()), int((~hi & ~is_set).sum())]]
     odds, fisher_p = fisher_exact(table, alternative="greater")
+    # Woolf 95% CI on log OR (0.5 added to every cell only if one is empty); docs/PREREG.md section 4
+    cells = np.array(table, dtype=float)
+    if (cells == 0).any():
+        cells += 0.5
+    log_or = float(np.log(cells[0, 0] * cells[1, 1] / (cells[0, 1] * cells[1, 0])))
+    se = float(np.sqrt((1 / cells).sum()))
     return {**out, "mean_pct_set": float(pct[is_set].mean()), "mean_pct_other": float(pct[~is_set].mean()),
             "mannwhitney_p": float(mannwhitneyu(pct[is_set], pct[~is_set], alternative="greater").pvalue),
-            "top5_odds_ratio": float(odds), "top5_fisher_p": float(fisher_p), "top5_table": table}
+            "top5_odds_ratio": float(odds), "top5_fisher_p": float(fisher_p), "top5_table": table,
+            "top5_log_or": log_or, "top5_log_or_se": se,
+            "top5_or_ci95": [float(np.exp(log_or - 1.96 * se)), float(np.exp(log_or + 1.96 * se))]}
+
+
+def tested_cpgs(egtex_dir: str | Path, stems: list[str] | None = None) -> set[str]:
+    """CpGs tested in the eGTEx cis-mQTL tables (mqtl/<stem>.regular.perm.fdr.txt; all tissues by
+    default). docs/PREREG.md section 4: the non-mQTL comparison set is tested-and-not-significant CpGs."""
+    files = sorted((Path(egtex_dir) / "mqtl").glob("*.regular.perm.fdr.txt"))
+    if stems is not None:
+        files = [f for f in files if f.name.split(".")[0] in stems]
+    return set().union(*(set(pd.read_csv(f, sep="\t", usecols=["cpg_id"]).cpg_id) for f in files)) if files else set()
 
 
 def read_set(path: Path) -> set[str]:

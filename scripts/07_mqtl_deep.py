@@ -40,6 +40,7 @@ from cpgpt_jepa.evaluation import (  # noqa: E402
     read_set,
     site_g,
     site_scores,
+    tested_cpgs,
     write_outputs,
 )
 
@@ -74,6 +75,11 @@ if has_w:
     any_set = read_set(egtex / "mqtl_sites_any.txt")
     sets = {"lung-only": lung_set - colon_set, "colon-only": colon_set - lung_set,
             "union (lung|colon)": lung_set | colon_set, "any tissue": any_set}
+    # docs/PREREG.md section 4: an mQTL set is compared with CpGs tested in its table(s) and not significant.
+    # The negative set is not an mQTL set, so its background stays all block sites.
+    t_lung, t_colon = tested_cpgs(egtex, ["Lung"]), tested_cpgs(egtex, ["ColonTransverse"])
+    universe = {"lung-only": t_lung, "colon-only": t_colon, "union (lung|colon)": t_lung | t_colon,
+                "any tissue": tested_cpgs(egtex)}
 
     # negative set: top-5% tissue- or age-associated CpGs by one-way ANOVA F on the betas (train donors), not mQTL
     X_mm, _, _, _ = open_processed(Path(run.enc_meta["dataset_dir"]))
@@ -120,7 +126,10 @@ if has_w:
             w_rows, var_g, _ = site_scores(run, R, samples)
             pct_cache[samp_name] = (w_rows, percentile_within_block(var_g, run.W_block[w_rows]))
         w_rows, pct = pct_cache[samp_name]
-        e = enrichment(pct, np.isin(run.site_probes[w_rows], sorted(sets[set_name])))
+        probes = run.site_probes[w_rows]
+        bg = np.isin(probes, sorted(universe[set_name])) if set_name in universe else np.ones(len(probes), bool)
+        e = enrichment(pct[bg], np.isin(probes[bg], sorted(sets[set_name])))
+        e["background"] = "CpGs tested in the mQTL table(s)" if set_name in universe else "all block sites"
         result["enrichment"][f"{set_name} / {samp_name}"] = e
         rows.append({"analysis": "enrichment", "set": set_name, "samples": samp_name, **{k: v for k, v in e.items() if k != "top5_table"}})
     print(f"[1] enrichment done ({time.time() - t0:.0f}s)", flush=True)
