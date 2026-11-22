@@ -48,6 +48,11 @@ p.add_argument("--window-mb", type=int, default=None,
 p.add_argument("--include-x", action="store_true", help="also encode chrX blocks (positive control, eval only)")
 p.add_argument("--full-sites", type=int, default=10000)
 p.add_argument("--seed", type=int, default=0)
+p.add_argument("--probe-mask", default="data/annotations/EPIC.hg38.mask.tsv.gz",
+               help="Zhou et al. 2017 EPIC hg38 mask (InfiniumAnnotationV1); probes with --mask-column TRUE are "
+                    "excluded from every block and from Z_full. 'none' keeps all probes (the secondary, "
+                    "unmasked analysis in docs/PREREG.md section 1)")
+p.add_argument("--mask-column", default="M_general")
 p.add_argument("--smoke", action="store_true", help="20 samples x 5 blocks, CPU allowed")
 p.add_argument("--allow-cpu", action="store_true")
 args = p.parse_args()
@@ -103,11 +108,23 @@ rows = embedding_rows(embedder, species, var, dna_llm, context_len)
 reverse_vocab = embedder.ensembl_metadata_dict[species]["reverse_vocab"]
 chrom_names = {int(c): str(reverse_vocab[int(c)]) for c in np.unique(var[:, 0])}
 print(f"X {X.shape}; {int((rows >= 0).sum())} sites with a DNA embedding ({time.time() - t0:.0f}s)", flush=True)
+usable = rows >= 0
+n_masked = 0
+if args.probe_mask.lower() != "none":
+    mask_tab = pd.read_csv(args.probe_mask, sep="\t", usecols=["Probe_ID", args.mask_column])
+    masked_ids = set(mask_tab.loc[mask_tab[args.mask_column].astype(str).str.upper() == "TRUE", "Probe_ID"])
+    is_masked = np.isin(probe_ids, sorted(masked_ids))
+    n_masked = int((usable & is_masked).sum())
+    usable &= ~is_masked
+    print(f"probe mask {args.probe_mask} ({args.mask_column}): {len(masked_ids)} probes listed, "
+          f"{n_masked} of the embedded sites removed, {int(usable.sum())} remain", flush=True)
+else:
+    print("probe mask: none (all embedded sites kept)", flush=True)
 
 # --- blocks ------------------------------------------------------------------------------------
 window_bp = (args.window_mb or (10 if n_sites >= 600_000 else 20)) * 1_000_000
 chromosomes = AUTOSOMES + (["X"] if args.include_x else [])
-blocks = build_blocks(var, chrom_names, rows >= 0, window_bp, args.min_sites, chromosomes)
+blocks = build_blocks(var, chrom_names, usable, window_bp, args.min_sites, chromosomes)
 if args.smoke:
     # 5 blocks on 5 different chromosomes (one of them X with --include-x), so sources exist
     picked, seen = [], set()
@@ -126,8 +143,8 @@ n_x = sum(b["chrom"] == "X" for b in blocks)
 print(f"{n_blocks} blocks of {window_bp // 1_000_000} Mb ({n_x} on chrX), {sizes.min()}-{sizes.max()} sites", flush=True)
 
 rng = np.random.default_rng(args.seed)
-n_full = min(args.full_sites if not args.smoke else 2000, int((rows >= 0).sum()))
-full_cols = rng.choice(np.flatnonzero(rows >= 0), size=n_full, replace=False)
+n_full = min(args.full_sites if not args.smoke else 2000, int(usable.sum()))
+full_cols = rng.choice(np.flatnonzero(usable), size=n_full, replace=False)
 full_cols = full_cols[np.lexsort((var[full_cols, 1], var[full_cols, 0]))]  # by chromosome, then position
 
 # DNA embeddings of the sites used, gathered once into RAM (sorted reads from the memmap)
@@ -207,6 +224,8 @@ meta = {
     "W_shape": [n_total, d], "W_dtype": "float16", "dataset_dir": str(dataset_dir),
     "sample_idx": sample_idx.tolist(), "dna_llm": dna_llm, "dna_context_len": context_len,
     "seed": args.seed, "smoke": args.smoke, "device": device.type,
+    "probe_mask": args.probe_mask, "mask_column": args.mask_column if args.probe_mask.lower() != "none" else None,
+    "n_masked_sites": n_masked,
 }
 (out / "encode_meta.json").write_text(json.dumps(meta, indent=2))
 
