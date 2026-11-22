@@ -68,7 +68,7 @@ if args.beta_space:
 
     beta_enc, out = Path(f"{enc}_beta"), Path(f"{out}_beta")
     if not (beta_enc / "Z.npy").exists():
-        build_beta_encodings(enc, beta_enc, args.metadata, seed=args.seed, log=lambda m: print(m, flush=True))
+        build_beta_encodings(enc, beta_enc, args.metadata, seed=args.split_seed, log=lambda m: print(m, flush=True))
     enc = beta_enc
 out.mkdir(parents=True, exist_ok=True)
 
