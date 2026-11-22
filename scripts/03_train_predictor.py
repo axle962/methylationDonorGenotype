@@ -40,7 +40,10 @@ p.add_argument("--metadata", default="data/egtex/metadata.csv")
 p.add_argument("--kinds", default=",".join(KINDS))
 p.add_argument("--struct", default=None, help="npz with a per-block 'profile' appended to c_B")
 p.add_argument("--tag", default=None, help="output name for a single --kinds entry (default: the kind)")
-p.add_argument("--seed", type=int, default=0)
+p.add_argument("--seed", type=int, default=0, help="predictor initialisation and training sampling")
+p.add_argument("--split-seed", type=int, default=0,
+               help="donor split, held-out blocks and fixed sources; keep it fixed across --seed runs so the "
+                    "test donors and the residual's definition stay the same (docs/PREREG.md section 1)")
 p.add_argument("--epochs", type=int, default=20)
 p.add_argument("--pairs-per-sample", type=int, default=64)
 p.add_argument("--batch-size", type=int, default=1024)
@@ -81,9 +84,10 @@ block_chrom = pd.factorize(chrom_names)[0]
 x_blocks = np.flatnonzero(chrom_names == "X")
 auto_blocks = np.flatnonzero(chrom_names != "X")
 
-splits = make_splits(meta.donor_id.to_numpy(), meta.tissue.to_numpy(), n_blocks, seed=args.seed,
+splits = make_splits(meta.donor_id.to_numpy(), meta.tissue.to_numpy(), n_blocks, seed=args.split_seed,
                      eval_only_blocks=x_blocks)
-sources = fixed_sources(block_chrom, args.k_sources, args.seed, pool=auto_blocks)  # (n_blocks, K)
+sources = fixed_sources(block_chrom, args.k_sources, args.split_seed, pool=auto_blocks)  # (n_blocks, K)
+splits["train_seed"] = args.seed
 splits["k_sources"] = int(sources.shape[1])
 splits["fixed_sources"] = sources.tolist()
 (out / "splits.json").write_text(json.dumps(splits))
@@ -120,7 +124,8 @@ for kind in kinds:
     model, train_log = train_predictor(
         kind, Zs, Cn, train_s, train_b, block_chrom, auto_blocks, epochs=args.epochs,
         pairs_per_sample=args.pairs_per_sample, batch_size=args.batch_size, lr=args.lr,
-        weight_decay=args.weight_decay, seed=args.seed, log=lambda m: print(m, flush=True))
+        weight_decay=args.weight_decay, seed=args.seed, k_sources=int(sources.shape[1]),
+        log=lambda m: print(m, flush=True))
     P, pair_mse = predict(model, Zs, Cn, sources)
     R = Zs - P
     kind_dir = out / name
@@ -168,10 +173,10 @@ print(f"elapsed: {time.time() - t0:.0f}s")
 
 if not all(np.isfinite(m["train_blocks"]["test_mse"]) for m in all_metrics.values()):
     finish(False, "non-finite test MSE")
-if "mlp" in all_metrics and "block_mean" in all_metrics:
-    mlp, base = (all_metrics[k]["train_blocks"]["test_mse"] for k in ("mlp", "block_mean"))
+for kind in (k for k in ("mlp_joint", "mlp") if k in all_metrics and "block_mean" in all_metrics):
+    mlp, base = (all_metrics[k]["train_blocks"]["test_mse"] for k in (kind, "block_mean"))
     if not mlp < base:
-        msg = f"mlp test MSE on train blocks ({mlp:.4f}) >= block_mean's ({base:.4f}): the predictor learned nothing"
+        msg = f"{kind} test MSE on train blocks ({mlp:.4f}) >= block_mean's ({base:.4f}): the predictor learned nothing"
         if not args.smoke:
             finish(False, msg)
         print(f"WARNING (smoke, not a failure): {msg}")
