@@ -18,6 +18,8 @@ if [[ "${FRESH:-0}" == 1 ]]; then rm -rf data/smoke; fi
 run_stage scripts/01_prepare_egtex.py --n-samples 50 --min-lung-colon-pairs 5 --arrow data/smoke/egtex.arrow --processed-dir data/smoke/processed
 run_stage scripts/02_encode_blocks.py --smoke --include-x --processed-dir data/smoke/processed --out "$S/encodings"
 run_stage scripts/03_train_predictor.py --smoke --enc "$S/encodings" --out "$S/predictor"
+run_stage scripts/03_train_predictor.py --smoke --beta-space --enc "$S/encodings" --out "$S/predictor"
+run_stage scripts/04_evaluate.py --smoke --beta-space --encodings "$S/encodings" --pred "$S/predictor"
 run_stage scripts/04_evaluate.py --smoke --encodings "$S/encodings" --pred "$S/predictor"
 run_stage scripts/05_ablations.py --smoke --encodings "$S/encodings" --pred "$S/predictor" --out "$S/experiments/ablations" --size-encodings "$S/encodings_{mb}mb"
 run_stage scripts/06_covariates.py --smoke --encodings "$S/encodings" --pred "$S/predictor" --out "$S/experiments/covariates"
