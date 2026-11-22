@@ -55,6 +55,9 @@ p.add_argument("--weight-decay", type=float, default=1e-4)
 p.add_argument("--d", type=int, default=256)
 p.add_argument("--n-directions", type=int, default=1024, help="SIGReg projections M (LeWM default 1024)")
 p.add_argument("--encode-batch", type=int, default=8)
+p.add_argument("--max-sites-encode", type=int, default=None,
+               help="sites per block when encoding after training (default: all). Full attention over a whole "
+                    "10 Mb block (~5k sites) needs ~6 GB per layer at batch 8 in fp32, so --smoke on CPU caps it")
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--skip-eval", action="store_true", help="train and encode only")
 p.add_argument("--smoke", action="store_true", help="2 epochs, few pairs, CPU allowed")
@@ -69,6 +72,7 @@ else:
     lam = 0.1  # LeWM default
 if args.smoke:
     args.epochs, args.pairs_per_sample, args.max_sites_train = 2, 4, 128
+    args.max_sites_encode = args.max_sites_encode or 512
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if device.type == "cpu" and not args.smoke:
     finish(False, "CUDA is not available in this job")
@@ -157,11 +161,13 @@ torch.save({"g": g.state_dict(), "f": f.state_dict(), "lam": lam, "args": vars(a
 # --- encode every (sample, block) with all its sites -------------------------------------------
 g.eval()
 Z = np.zeros((len(obs_names), len(blocks), args.d), dtype=np.float32)
+enc_gen = torch.Generator(device=device).manual_seed(args.seed)  # fixed subsample when --max-sites-encode is set
 with torch.no_grad(), autocast(device):
     for b in range(len(blocks)):
         for i in range(0, len(obs_names), args.encode_batch):
             sm = torch.arange(i, min(i + args.encode_batch, len(obs_names)), device=device)
-            Z[sm.cpu().numpy(), b] = g(*data.batch(sm, torch.full_like(sm, b))).float().cpu().numpy()
+            Z[sm.cpu().numpy(), b] = g(*data.batch(sm, torch.full_like(sm, b), args.max_sites_encode,
+                                                    enc_gen)).float().cpu().numpy()
 np.save(run_dir / "Z.npy", Z)
 np.save(run_dir / "C.npy", C)
 np.save(run_dir / "blocks.npy", blocks, allow_pickle=True)

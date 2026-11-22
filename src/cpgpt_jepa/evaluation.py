@@ -231,7 +231,10 @@ def write_outputs(out_dir: Path, result: dict, rows: list[dict] | None = None, c
     (out_dir / "result.json").write_text(json.dumps(result, indent=2, default=_json_default))
     if rows:
         with open(out_dir / csv_name, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            # Rows from different sections can carry different extra keys (e.g. 05's n_blocks), so the
+            # header is the union of keys in first-seen order and missing cells are left blank.
+            fields = list(dict.fromkeys(k for r in rows for k in r))
+            writer = csv.DictWriter(f, fieldnames=fields, restval="")
             writer.writeheader()
             writer.writerows(rows)
 
