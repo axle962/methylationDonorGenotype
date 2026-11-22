@@ -75,4 +75,7 @@ genomics-2.pdf): eGTEx core (01-07) first, then the 3D compartment/Hi-C control 
 - Splits are donor-disjoint; all lung+colon donors are test donors. Standardisation uses train-donor stats only.
 - Jobs go through `slurm/*.sbatch` (conventions copied from the predplan repo); every job log ends with SANITY_OK / SANITY_FAIL.
 - Never submit a Slurm job unless the user says to submit, in their own words, at that moment.
+  Exception: the autonomous session started by `slurm/agent_session.sbatch` has the user's written
+  authorisation (2026-11-22, `docs/agent/BRIEF.md`) to submit the jobs its brief needs, through
+  `slurm/submit.sh` only, within the GPU-hour budget that `slurm/gpu_budget.sh` enforces.
 - Python 3.10+, type hints, ruff; no new heavy dependencies without asking.

@@ -15,4 +15,7 @@ fi
 set -a; source "$ENV_FILE"; set +a
 
 mkdir -p slurm/logs  # Slurm opens --output=slurm/logs/... before the job script runs
+# GPU jobs must fit the project's GPU-hour budget (slurm/gpu_budget.sh; GPU_BUDGET_* in local.env).
+source slurm/gpu_budget.sh
+gpu_budget_check "$@" || exit 3
 sbatch "$@"
