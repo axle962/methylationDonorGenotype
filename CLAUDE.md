@@ -11,8 +11,8 @@ different chromosomes (c_B = mean sequence embedding of B's sites). What f recov
 state (tissue, age, sex); the residual r = z_B - f(z_A, c_B) is what is local to B. Hypothesis: the
 residual is dominated by local genetic effects (mQTLs), hence donor-specific and consistent across a
 donor's tissues. Tests: (1) sites driving the residual are enriched for catalogued mQTL CpGs;
-(2) a donor's lung residual retrieves the same donor's colon sample. Deferred: the 3D-structure /
-compartment control from the proposal (docs/proposal.md).
+(2) a donor's lung residual retrieves the same donor's colon sample. Scope (Nov 2026, PDF proposal in
+genomics-2.pdf): eGTEx core (01-07) first, then the 3D compartment/Hi-C control (08); GoDMC and GEO blood later.
 
 ## CpGPT facts we rely on (verified in source)
 - Sample embedding = CLS output of `net.encode_sample(meth, sequence_embeddings, chroms, positions, mask_na)`.
@@ -36,7 +36,7 @@ compartment control from the proposal (docs/proposal.md).
 - `data/egtex/metadata.csv` (sample_id, gsm, donor_id, tissue, sex, plate, sentrix_id);
   `data/egtex/mqtl_sites_<Tissue>.txt` and `mqtl_sites_any.txt` (q<0.05 cis-mQTL CpGs);
   `data/egtex/mqtl/*.regular.perm.fdr.txt` (source tables).
-- CpGPT bundle, in the Hugging Face cache (`HF_HOME=/scratch/sp9002/cache/huggingface`), default model `small`:
+- CpGPT bundle, in the Hugging Face cache (`HF_HOME=/scratch/am16489/hf_cache` on NYU Cloud Bursting; set in `slurm/local.env`), default model `small`:
   - checkpoint `$HF_HOME/hub/models--lucascamillomd--cpgpt-models/snapshots/dd4d31e8579123ebfe77b6d5ad1049203b4d0a6d/weights/small.ckpt`
   - config `.../snapshots/dd4d31e8579123ebfe77b6d5ad1049203b4d0a6d/config/small.yaml`
   - vocab `.../snapshots/dd4d31e8579123ebfe77b6d5ad1049203b4d0a6d/vocab/small.json` (1,187,190 probe ids)

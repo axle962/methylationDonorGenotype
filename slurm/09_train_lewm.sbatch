@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --nodes=1
+#SBATCH --partition=g2-standard-12
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
-#SBATCH --constraint="l40s|h200|h100|a100"
-#SBATCH --mem=64G
+#SBATCH --mem=44G
 #SBATCH --time=12:00:00
 #SBATCH --job-name=jepa_09_train_lewm
 #SBATCH --array=0-2

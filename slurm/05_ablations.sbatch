@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --nodes=1
+#SBATCH --partition=n2d32p
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
