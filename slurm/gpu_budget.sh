@@ -21,18 +21,36 @@ slurm_time_hours() {
 
 # Prints "used committed" in GPU-hours for jepa_* jobs since GPU_BUDGET_START.
 gpu_budget_usage() {
-  sacct -u "$USER" -S "$GPU_BUDGET_START" -X -n -P -o JobName,State,ElapsedRaw,TimelimitRaw,AllocTRES,ReqTRES 2>/dev/null |
-    awk -F'|' '
-      $1 !~ /^jepa_/ { next }
-      {
-        tres = ($5 != "") ? $5 : $6; g = 0
+  # sacct omits jobs still waiting on a dependency, so queued jepa_* jobs that squeue lists but
+  # sacct does not are added to "committed" at their full time limit.
+  {
+    sacct -u "$USER" -S "$GPU_BUDGET_START" -X -n -P -o JobID,JobName,State,ElapsedRaw,TimelimitRaw,AllocTRES,ReqTRES 2>/dev/null |
+      sed 's/^/A|/'
+    squeue -u "$USER" -h -o "%i|%j|%l|%b" 2>/dev/null | while IFS='|' read -r id name lim gres; do
+      echo "Q|${id}|${name}|$(slurm_time_hours "$lim")|${gres}"
+    done
+  } | awk -F'|' '
+      $3 !~ /^jepa_/ { next }
+      $1 == "A" {
+        seen[$2] = 1
+        tres = ($7 != "") ? $7 : $8; g = 0
         if (match(tres, /gres\/gpu=[0-9]+/)) g = substr(tres, RSTART + 9, RLENGTH - 9) + 0
         if (g == 0) next
-        el = $3 / 3600; lim = ($4 ~ /^[0-9]+$/) ? $4 / 60 : el
+        el = $5 / 3600; lim = ($6 ~ /^[0-9]+$/) ? $6 / 60 : el
         used += el * g
-        if ($2 ~ /^(PENDING|RUNNING|REQUEUED|SUSPENDED|CONFIGURING)/) { rem = lim - el; if (rem > 0) com += rem * g }
+        if ($4 ~ /^(PENDING|RUNNING|REQUEUED|SUSPENDED|CONFIGURING)/) { rem = lim - el; if (rem > 0) com += rem * g }
+        next
       }
-      END { printf "%.2f %.2f\n", used, used + com }'
+      $1 == "Q" { q[$2] = $0 }
+      END {
+        for (id in q) {
+          if (id in seen) continue
+          split(q[id], f, "|"); g = 0
+          if (match(f[5], /gpu:([a-z0-9]+:)?[0-9]+/)) { s = substr(f[5], RSTART, RLENGTH); n = split(s, p, ":"); g = p[n] + 0 }
+          com += f[4] * g
+        }
+        printf "%.2f %.2f\n", used, used + com
+      }'
 }
 
 # gpu_budget_check <sbatch args...>: exit 0 if the job requests no GPU or fits the budget.
