@@ -9,7 +9,7 @@
 #         02 at 5 Mb and 20 Mb -> 05 (seed 0, after 04 seed 0)
 #   10 after everything.
 # Stage outputs: experiments for seed 0 in outputs/experiments/<name>, for seed s in outputs/experiments_seed<s>/<name>.
-# Env: DRY_RUN=1 prints the commands without submitting; SKIP_01=1 starts from existing data/processed;
+# Env: DRY_RUN=1 prints the commands without submitting; SKIP_01=1 starts from existing data/processed (DEP_01=<jobid> makes 02 wait for a stage 01 job submitted separately);
 #      GPU_TIME_02, GPU_TIME_02U, GPU_TIME_02_5, GPU_TIME_02_20 set --time of the GPU jobs (default 06:00:00).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -33,7 +33,7 @@ say() { printf '%-22s%s\n' "$1:" "$2"; }
 pred() { [[ "$1" == 0 ]] && echo outputs/predictor || echo "outputs/predictor_seed$1"; }
 expd() { [[ "$1" == 0 ]] && echo outputs/experiments || echo "outputs/experiments_seed$1"; }
 
-j01=""
+j01="${DEP_01:-}"  # with SKIP_01=1: an already-submitted stage 01 job that 02 waits for
 if [[ "${SKIP_01:-0}" != 1 ]]; then j01=$(submit "" slurm/01_prepare.sbatch); say 01_prepare "$j01"; fi
 j02=$(submit "$j01" slurm/02_encode.sbatch "--time=${GPU_TIME_02:-06:00:00}" -- --include-x --out outputs/encodings)
 say 02_encode "$j02"
