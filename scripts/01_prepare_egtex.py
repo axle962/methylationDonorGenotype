@@ -35,6 +35,12 @@ p.add_argument("--n-samples", type=int, default=None, help="keep a random subset
 p.add_argument("--min-lung-colon-pairs", type=int, default=0,
                help="with --n-samples: include at least this many donors with both lung and colon")
 p.add_argument("--seed", type=int, default=0)
+p.add_argument("--writer", choices=["native", "datasaver"], default="native",
+               help="native: write the CpGPTDataSaver memmap layout in column chunks; datasaver: upstream "
+                    "CpGPTDataSaver.process_files (too slow for the full 987 x ~750k matrix in 22 GB)")
+p.add_argument("--write-chunk", type=int, default=8192, help="native writer: columns per chunk")
+p.add_argument("--compare-to", default=None,
+               help="dataset folder written by the other writer; fail unless every file matches")
 args = p.parse_args()
 
 egtex = Path(args.egtex_dir)
@@ -133,13 +139,12 @@ else:
 print("\n=== CpGPTDataSaver.process_files ===", flush=True)
 embedder = DNALLMEmbedder(dependencies_dir=deps_dir)
 prober = IlluminaMethylationProber(dependencies_dir=deps_dir, embedder=embedder)
-CpGPTDataSaver(data_paths=str(arrow_path), processed_dir=args.processed_dir).process_files(prober, embedder)
 
-dataset_dir = find_dataset_dir(args.processed_dir)
-X, var, obs_names, species = open_processed(dataset_dir)
-
-# Probe id of every X column. The datasaver stores only (chrom, position) per site
-# (var_names.npy is ["chrom", "position"]), so repeat its column filter to keep the probe ids.
+# The datasaver's column filter, repeated: a probe is kept if the Illumina manifest maps it to a
+# location whose chromosome is in the embedder vocab, in arrow column order (duplicates kept).
+# The native writer writes X from it; with the datasaver it recovers the probe id of each X column
+# (var_names.npy is only ["chrom", "position"]).
+species = "homo_sapiens"  # the arrow's species column (see above)
 illumina = prober.illumina_metadata_dict[species]
 chrom_vocab = embedder.ensembl_metadata_dict[species]["vocab"]
 kept = [(p, illumina[p]) for p in probes if p in illumina and illumina[p].split(":")[0] in chrom_vocab]
@@ -148,11 +153,63 @@ expected_var = np.array(
     [[chrom_vocab[loc.replace("chr", "").split(":")[0]], int(loc.split(":")[1])] for _, loc in kept],
     dtype=np.int32,
 )
+
+if args.writer == "datasaver":
+    CpGPTDataSaver(data_paths=str(arrow_path), processed_dir=args.processed_dir).process_files(prober, embedder)
+else:
+    # Same files as CpGPTDataSaver._save_processed_data, in the same dataset folder, but written in
+    # column chunks from the arrow file instead of through one pandas frame with ~750k columns
+    # (which ran 4 h at the 22 GB node limit without finishing). The datasaver's sqlite files
+    # (dataset_metrics.db, genomic_locations.db) are not written: nothing downstream reads them.
+    out_dir = Path(args.processed_dir) / str(arrow_path.with_suffix("")).replace("/", "_").replace("\\", "_")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    table = pa.ipc.open_file(str(arrow_path)).read_all()
+    col_index = {n: i for i, n in enumerate(table.schema.names)}
+    cols = [col_index[p] for p in probe_ids]
+    obs = np.array(table.column(col_index["sample_id"]).to_pylist(), dtype=object)
+    Xw = np.memmap(out_dir / "X.mmap", dtype="float32", mode="w+", shape=(len(obs), len(cols)))
+    for j0 in range(0, len(cols), args.write_chunk):
+        block = [table.column(c).to_numpy(zero_copy_only=False) for c in cols[j0 : j0 + args.write_chunk]]
+        Xw[:, j0 : j0 + len(block)] = np.stack(block, axis=1).astype(np.float32, copy=False)
+    Xw.flush()
+    varw = np.memmap(out_dir / "var.mmap", dtype="int32", mode="w+", shape=expected_var.shape)
+    varw[:] = expected_var
+    varw.flush()
+    np.save(out_dir / "var_names.npy", ["chrom", "position"])
+    np.save(out_dir / "obs_names.npy", obs)
+    np.save(out_dir / "species.npy", species)
+    np.save(out_dir / "X_shape.npy", (len(obs), len(cols)))
+    del Xw, varw, table
+    print(f"native writer: {out_dir} ({len(obs)} x {len(cols)}, {time.time() - t0:.0f}s)", flush=True)
+
+dataset_dir = find_dataset_dir(args.processed_dir)
+X, var, obs_names, species = open_processed(dataset_dir)
 if expected_var.shape != var.shape or not np.array_equal(expected_var, np.asarray(var)):
     finish(False, "probe ids could not be aligned to the datasaver's var.mmap")
 if list(obs_names) != list(meta.sample_id):
     finish(False, "obs_names.npy does not match the metadata sample order")
 np.save(dataset_dir / "probe_ids.npy", probe_ids)
+
+if args.compare_to:
+    # Writer equivalence (smoke): every file both writers produce must be identical.
+    ref = Path(args.compare_to)
+    Xr, varr, obsr, speciesr = open_processed(ref)
+    checks = {
+        "X.mmap (NaN-aware)": Xr.shape == X.shape and np.array_equal(np.asarray(Xr), np.asarray(X), equal_nan=True),
+        "X.mmap bytes": (ref / "X.mmap").read_bytes() == (dataset_dir / "X.mmap").read_bytes(),
+        "var.mmap": np.array_equal(np.asarray(varr), np.asarray(var)),
+        "obs_names.npy": list(obsr) == list(obs_names),
+        "species.npy": speciesr == species,
+        "var_names.npy": list(np.load(ref / "var_names.npy", allow_pickle=True))
+        == list(np.load(dataset_dir / "var_names.npy", allow_pickle=True)),
+        "X_shape.npy": list(np.load(ref / "X_shape.npy", allow_pickle=True))
+        == list(np.load(dataset_dir / "X_shape.npy", allow_pickle=True)),
+    }
+    print(f"\n=== compare with {ref} ===")
+    for name, ok in checks.items():
+        print(f"  {name:<20s} {'identical' if ok else 'DIFFERS'}")
+    if not all(checks.values()):
+        finish(False, f"writer output differs from {ref}")
 
 rows = embedding_rows(embedder, species, var, config.data.dna_llm, config.data.dna_context_len)
 n_nan = sum(int(np.isnan(X[i : i + 64]).sum()) for i in range(0, X.shape[0], 64))
