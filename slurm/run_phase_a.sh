@@ -10,6 +10,7 @@
 #   10 after everything.
 # Stage outputs: experiments for seed 0 in outputs/experiments/<name>, for seed s in outputs/experiments_seed<s>/<name>.
 # Env: DRY_RUN=1 prints the commands without submitting; SKIP_01=1 starts from existing data/processed (DEP_01=<jobid> makes 02 wait for a stage 01 job submitted separately);
+#      ENC02_CPU=1 runs the main 02 on a 24-CPU n2c48m24 node (CPU_TIME_02, default 3 days);
 #      GPU_TIME_02, GPU_TIME_02U, GPU_TIME_02_5, GPU_TIME_02_20 set --time of the GPU jobs (default 06:00:00).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -35,7 +36,12 @@ expd() { [[ "$1" == 0 ]] && echo outputs/experiments || echo "outputs/experiment
 
 j01="${DEP_01:-}"  # with SKIP_01=1: an already-submitted stage 01 job that 02 waits for
 if [[ "${SKIP_01:-0}" != 1 ]]; then j01=$(submit "" slurm/01_prepare.sbatch); say 01_prepare "$j01"; fi
-j02=$(submit "$j01" slurm/02_encode.sbatch "--time=${GPU_TIME_02:-06:00:00}" -- --include-x --out outputs/encodings)
+if [[ "${ENC02_CPU:-0}" == 1 ]]; then  # main encoding on a whole CPU node (no checkpointing: generous --time)
+  j02=$(submit "$j01" slurm/02_encode.sbatch --partition=n2c48m24 --gres=none --mem=22G --cpus-per-task=24 \
+    "--time=${CPU_TIME_02:-3-00:00:00}" -- --include-x --allow-cpu --out outputs/encodings)
+else
+  j02=$(submit "$j01" slurm/02_encode.sbatch "--time=${GPU_TIME_02:-06:00:00}" -- --include-x --out outputs/encodings)
+fi
 say 02_encode "$j02"
 
 # extra encodings: after 02 masked
