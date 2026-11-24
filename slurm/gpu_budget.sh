@@ -26,11 +26,12 @@ gpu_budget_usage() {
   {
     sacct -u "$USER" -S "$GPU_BUDGET_START" -X -n -P -o JobID,JobName,State,ElapsedRaw,TimelimitRaw,AllocTRES,ReqTRES 2>/dev/null |
       sed 's/^/A|/'
-    squeue -u "$USER" -h -o "%i|%j|%l|%b" 2>/dev/null | while IFS='|' read -r id name lim gres; do
+    squeue -r -u "$USER" -h -o "%i|%j|%l|%b" 2>/dev/null | while IFS='|' read -r id name lim gres; do
       echo "Q|${id}|${name}|$(slurm_time_hours "$lim")|${gres}"
     done
   } | awk -F'|' '
       $3 !~ /^jepa_/ { next }
+      $1 == "A" && $2 ~ /\[/ { next }  # a pending array summary row; squeue -r lists its tasks
       $1 == "A" {
         seen[$2] = 1
         tres = ($7 != "") ? $7 : $8; g = 0
@@ -55,22 +56,27 @@ gpu_budget_usage() {
 
 # gpu_budget_check <sbatch args...>: exit 0 if the job requests no GPU or fits the budget.
 gpu_budget_check() {
-  local file="" a gres="" time="" args=("$@")
+  local file="" a gres="" time="" array="" args=("$@")
   for a in "${args[@]}"; do [[ "$a" == *.sbatch && -f "$a" ]] && { file="$a"; break; }; done
   for a in "${args[@]}"; do
-    case "$a" in --gres=*) gres="${a#--gres=}" ;; --time=*|-t=*) time="${a#*=}" ;; esac
+    case "$a" in --gres=*) gres="${a#--gres=}" ;; --time=*|-t=*) time="${a#*=}" ;; --array=*) array="${a#--array=}" ;; esac
     [[ "$a" == "$file" ]] && break   # options after the script belong to the script
   done
   if [[ -n "$file" ]]; then
     [[ -z "$gres" ]] && gres=$(sed -n 's/^#SBATCH --gres=//p' "$file" | head -1)
     [[ -z "$time" ]] && time=$(sed -n 's/^#SBATCH --time=//p' "$file" | head -1)
+    [[ -z "$array" ]] && array=$(sed -n 's/^#SBATCH --array=//p' "$file" | head -1)
   fi
+  # array tasks: "0-2", "0,3,5-7" (a %throttle suffix is ignored); each task gets the full time limit
+  local ntask=1
+  [[ -n "$array" ]] && ntask=$(awk -v a="${array%%%*}" 'BEGIN { n = 0; k = split(a, r, ",")
+      for (i = 1; i <= k; i++) { if (split(r[i], e, "-") == 2) n += e[2] - e[1] + 1; else n += 1 } print n }')
   local ngpu
   ngpu=$(sed -n 's/.*gpu:\([a-z0-9]*:\)\{0,1\}\([0-9][0-9]*\).*/\2/p' <<<"$gres")
   [[ -z "$ngpu" || "$ngpu" == 0 ]] && return 0
   [[ -z "$time" ]] && { echo "gpu budget: refusing a GPU job with no --time" >&2; return 1; }
   local req used committed
-  req=$(awk -v h="$(slurm_time_hours "$time")" -v g="$ngpu" 'BEGIN { printf "%.2f", h * g }')
+  req=$(awk -v h="$(slurm_time_hours "$time")" -v g="$ngpu" -v n="$ntask" 'BEGIN { printf "%.2f", h * g * n }')
   read -r used committed < <(gpu_budget_usage)
   if awk -v c="$committed" -v r="$req" -v b="$GPU_BUDGET_HOURS" 'BEGIN { exit !(c + r <= b) }'; then
     echo "gpu budget: ok, ${req} GPU-h requested; used ${used}, committed ${committed} of ${GPU_BUDGET_HOURS}" >&2
