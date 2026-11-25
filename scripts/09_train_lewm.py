@@ -54,6 +54,11 @@ p.add_argument("--lr", type=float, default=3e-4)
 p.add_argument("--weight-decay", type=float, default=1e-4)
 p.add_argument("--d", type=int, default=256)
 p.add_argument("--n-directions", type=int, default=1024, help="SIGReg projections M (LeWM default 1024)")
+p.add_argument("--sigreg-mode", choices=["global", "within"], default="global",
+               help="global: SIGReg on z_A and z_B over the batch (LeWM; lets samples collapse inside a block). "
+                    "within: batches of --blocks-per-batch target blocks x (batch-size / blocks-per-batch) samples, "
+                    "SIGReg on z_B minus its block's batch mean; z_A keeps the global term. Run dir gets a _within suffix")
+p.add_argument("--blocks-per-batch", type=int, default=4, help="target blocks per batch in --sigreg-mode within")
 p.add_argument("--encode-batch", type=int, default=8)
 p.add_argument("--max-sites-encode", type=int, default=None,
                help="sites per block when encoding after training (default: all). Full attention over a whole "
@@ -78,7 +83,11 @@ if device.type == "cpu" and not args.smoke:
     finish(False, "CUDA is not available in this job")
 dtype = torch.float16 if device.type == "cuda" else torch.float32
 t0 = time.time()
-run_dir = Path(args.out_root) / f"lam{lam:g}"
+within = args.sigreg_mode == "within"
+if within and (args.batch_size % args.blocks_per_batch or args.batch_size // args.blocks_per_batch < 2):
+    finish(False, f"--batch-size {args.batch_size} must be a multiple of --blocks-per-batch {args.blocks_per_batch}"
+                  " with at least 2 samples per block")
+run_dir = Path(args.out_root) / (f"lam{lam:g}" + ("_within" if within else ""))
 run_dir.mkdir(parents=True, exist_ok=True)
 log = lambda m: print(m, flush=True)  # noqa: E731
 log(f"lambda {lam}; device {device.type}; run dir {run_dir}")
@@ -126,36 +135,64 @@ opt = torch.optim.AdamW(list(g.parameters()) + list(f.parameters()), lr=args.lr,
 scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 train_s_t, train_b_t = torch.as_tensor(train_s, device=device), torch.as_tensor(train_b, device=device)
 codes_t, pool_t = torch.as_tensor(codes, device=device), torch.as_tensor(auto, device=device)
+k_blk = args.blocks_per_batch
+m_smp = min(args.batch_size // k_blk, len(train_s))  # capped for --smoke-sized data
+
+
+def grouped_batch() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """--sigreg-mode within: k_blk random train target blocks, m_smp distinct random train samples for each."""
+    tb = train_b_t[torch.randint(len(train_b), (k_blk,), generator=gen, device=device)].repeat_interleave(m_smp)
+    sb = torch.cat([train_s_t[torch.randperm(len(train_s), generator=gen, device=device)[:m_smp]]
+                    for _ in range(k_blk)])
+    return sb, sample_sources(tb, codes_t, pool_t, gen), tb
+
+
 history, step = [], 0
 for epoch in range(args.epochs):
     g.train(), f.train()
     n_ex = len(train_s) * args.pairs_per_sample
-    s = train_s_t.repeat_interleave(args.pairs_per_sample)
-    tgt = train_b_t[torch.randint(len(train_b), (n_ex,), generator=gen, device=device)]
-    src = sample_sources(tgt, codes_t, pool_t, gen)
-    perm = torch.randperm(n_ex, generator=gen, device=device)
-    tot_pred = tot_reg = 0.0
+    if not within:
+        s = train_s_t.repeat_interleave(args.pairs_per_sample)
+        tgt = train_b_t[torch.randint(len(train_b), (n_ex,), generator=gen, device=device)]
+        src = sample_sources(tgt, codes_t, pool_t, gen)
+        perm = torch.randperm(n_ex, generator=gen, device=device)
+    tot_pred = tot_reg = tot_wvar = 0.0
     for i in range(0, n_ex, args.batch_size):
-        idx = perm[i : i + args.batch_size]
-        if len(idx) < 2:  # BatchNorm in the projectors needs at least 2 examples
-            continue
+        if within:
+            s_i, src_i, tgt_i = grouped_batch()
+        else:
+            idx = perm[i : i + args.batch_size]
+            if len(idx) < 2:  # BatchNorm in the projectors needs at least 2 examples
+                continue
+            s_i, src_i, tgt_i = s[idx], src[idx], tgt[idx]
         with autocast(device):
-            z_a = g(*data.batch(s[idx], src[idx], args.max_sites_train, gen))
-            z_b = g(*data.batch(s[idx], tgt[idx], args.max_sites_train, gen))
-            pred_loss = torch.nn.functional.mse_loss(f(z_a, Cn[tgt[idx]], tgt[idx]).float(), z_b.float())
-        # SIGReg on the encoder embeddings: z_A and z_B separately, averaged (LeWM applies it per time step)
-        reg = 0.5 * (sigreg(z_a.float(), args.n_directions, step) + sigreg(z_b.float(), args.n_directions, step))
+            z_a = g(*data.batch(s_i, src_i, args.max_sites_train, gen))
+            z_b = g(*data.batch(s_i, tgt_i, args.max_sites_train, gen))
+            pred_loss = torch.nn.functional.mse_loss(f(z_a, Cn[tgt_i], tgt_i).float(), z_b.float())
+        if within:
+            # z_B minus its block's batch mean: the regulariser now spreads samples inside a block
+            zb = z_b.float().view(k_blk, m_smp, -1)
+            zb_dev = (zb - zb.mean(1, keepdim=True)).reshape(len(s_i), -1)
+            reg = 0.5 * (sigreg(z_a.float(), args.n_directions, step) + sigreg(zb_dev, args.n_directions, step))
+            wvar = zb.var(1).mean().item()
+        else:
+            # SIGReg on the encoder embeddings: z_A and z_B separately, averaged (LeWM applies it per time step)
+            reg = 0.5 * (sigreg(z_a.float(), args.n_directions, step) + sigreg(z_b.float(), args.n_directions, step))
+            wvar = float("nan")
         loss = pred_loss + lam * reg
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(opt)
         scaler.update()
-        tot_pred += pred_loss.item() * len(idx)
-        tot_reg += reg.item() * len(idx)
+        tot_pred += pred_loss.item() * len(s_i)
+        tot_reg += reg.item() * len(s_i)
+        tot_wvar += wvar * len(s_i)
         step += 1
-    history.append({"epoch": epoch + 1, "pred_mse": tot_pred / n_ex, "sigreg": tot_reg / n_ex})
+    history.append({"epoch": epoch + 1, "pred_mse": tot_pred / n_ex, "sigreg": tot_reg / n_ex,
+                    "within_block_var_zb": tot_wvar / n_ex})
     log(f"epoch {epoch + 1:>2d}/{args.epochs}  pred MSE {history[-1]['pred_mse']:.4f}  SIGReg {history[-1]['sigreg']:.4f}"
-        f"  ({time.time() - t0:.0f}s)")
+        + (f"  within-block var(z_B) {history[-1]['within_block_var_zb']:.4f}" if within else "")
+        + f"  ({time.time() - t0:.0f}s)")
 torch.save({"g": g.state_dict(), "f": f.state_dict(), "lam": lam, "args": vars(args)}, run_dir / "lewm.pt")
 
 # --- encode every (sample, block) with all its sites -------------------------------------------
@@ -174,7 +211,8 @@ np.save(run_dir / "blocks.npy", blocks, allow_pickle=True)
 np.save(run_dir / "obs_names.npy", obs_names, allow_pickle=True)
 (run_dir / "encode_meta.json").write_text(json.dumps({
     **{k: enc_meta[k] for k in ("window_bp", "dataset_dir", "dna_llm", "dna_context_len", "n_x_blocks") if k in enc_meta},
-    "model": "lewm", "lam": lam, "d": args.d, "n_samples": len(obs_names), "n_blocks": len(blocks),
+    "model": "lewm", "lam": lam, "sigreg_mode": args.sigreg_mode, "blocks_per_batch": k_blk if within else None,
+    "d": args.d, "n_samples": len(obs_names), "n_blocks": len(blocks),
     "sample_idx": sample_rows.tolist(), "frozen_encodings": str(enc), "history": history, "smoke": args.smoke}, indent=2))
 finite = bool(np.isfinite(Z).all())
 log(f"encoded Z {Z.shape}, finite {finite} ({time.time() - t0:.0f}s)")
@@ -240,7 +278,7 @@ if not args.skip_eval:
         rc = subprocess.run([sys.executable, *cmd], cwd=REPO, env=env).returncode
         eval_status[name] = "ok" if rc == 0 else f"exit code {rc}"
 
-print(f"\n=== 09 LeWM (lambda = {lam}) ===")
+print(f"\n=== 09 LeWM (lambda = {lam}, SIGReg {args.sigreg_mode}) ===")
 print(f"training: {args.epochs} epochs; last pred MSE {history[-1]['pred_mse']:.4f}, SIGReg {history[-1]['sigreg']:.4f}")
 print(f"post-hoc decoder (g -> block betas): mean test R^2 {decoder_r2:.3f}")
 print("linear probes on the block-mean latent (test donors): accuracy for sex/tissue, R^2 for age / genotype PCs")
