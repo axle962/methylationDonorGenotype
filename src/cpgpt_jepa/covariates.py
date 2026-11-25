@@ -48,9 +48,19 @@ def one_hot(values: np.ndarray) -> np.ndarray:
 
 def numeric(values: np.ndarray) -> np.ndarray:
     """Column with missing values set to the mean."""
-    v = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
+    v = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float, copy=True)
     v[np.isnan(v)] = np.nanmean(v) if np.isfinite(v).any() else 0.0
     return v[:, None]
+
+
+def categorical_or_numeric(values: np.ndarray) -> np.ndarray:
+    """numeric() if every non-missing value parses as a number, else one_hot() of the labels (missing as its own
+    level). Sex in metadata.csv may be text ("Male"/"Female"), which numeric() would turn into a zero column."""
+    s = pd.Series(values)
+    present = s.notna()
+    if pd.to_numeric(s[present], errors="coerce").notna().all():
+        return numeric(values)
+    return one_hot(s.fillna("NA").astype(str).to_numpy())
 
 
 def residualise(Y: np.ndarray, X: np.ndarray) -> np.ndarray:
