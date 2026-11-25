@@ -50,6 +50,17 @@ reported.
 
 Pass 1–3 → "a donor-specific subspace exists"; pass 4–5 → "it is genetic"; fail at 2 → negative result, Phase B becomes the question.
 
+## Beta-space ladder (docs/PREREG.md amendment A1, Plan A)
+
+The CpGPT ladder failed at rung 2 while the beta-space residual matched donors, so the same ladder is run on the
+beta-space residual (`outputs/encodings_beta`, `outputs/predictor*_beta`) with three added criteria: B3 matching on
+donors whose lung and colon share no plate or chip (stage 06 `batch`), B4 mQTL and negative-set enrichment with the
+percentile taken within (block, train-beta variance decile) (stage 07 `enrichment_variance_matched`), and B4c
+cross-tissue concordance of the residual at the strongest mQTL CpGs vs variance-matched controls (stage 07
+`concordance`). `slurm/run_phase_a_beta.sh` (CPU only) runs 03/04 `--beta-space` on the unmasked encodings, 06, 07
+and 08 on the beta-space residual for seeds 0-2, then `10_decide.py --space beta` -> `outputs/decision_beta.json`.
+`tests/run_fixture.sh` runs 03, 04, 06, 07 and 10 on synthetic data on a laptop.
+
 ## Phase B — end-to-end block encoder (`src/cpgpt_jepa/lewm.py`, `scripts/09_train_lewm.py`)
 
 The frozen CpGPT encoder is replaced by a block encoder trained end to end in the LeWorldModel recipe

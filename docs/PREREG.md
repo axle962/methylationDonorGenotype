@@ -96,4 +96,36 @@ Run after rungs 1-5, on the same predictor.
 
 | Date | Change | Reason | Seen any result it affects? |
 |---|---|---|---|
-| | | | |
+| 2026-11-25 | Amendment A1 (section 8): a second, beta-space ladder, with three added criteria (B3 cross-batch, B4 variance-matched enrichment, B4c cross-tissue concordance). The CpGPT ladder above is unchanged. | The CpGPT ladder failed at rung 2 while the beta-space residual matched donors (REPORT.md task 6), so the question becomes whether that residual is genetic. | Rungs 1-2 in beta space: yes (top-1 0.745 / 0.830 reported in REPORT.md). B3, B4, B4c, B5, B6 and the beta-space leakage guard: no, none of them has been computed. |
+
+## 8. Amendment A1 (2026-11-25): beta-space ladder
+
+**Status: written 2026-11-25 on the user's go-ahead for "Plan A". The thresholds below should be read and
+approved before `slurm/run_phase_a_beta.sh` is submitted; the results they govern have not been computed.**
+
+**Why.** The CpGPT ladder failed at rung 2. The decisive control (section 3), the same predictor and residual on a
+per-block PCA of the betas, matched donors at top-1 0.745 (lung to colon) and 0.830 (colon to lung). That rule
+says the finding is about methylation data. This amendment sets out in advance how that beta-space residual is
+tested for being batch-driven, SNP-artefact-driven or genetic. Sections 1 to 7 stay as written and apply to the
+CpGPT result, which is reported as the negative control.
+
+**Representation.** The `mlp_joint` residual on the beta-space encodings (`outputs/encodings_beta`, k = 128 PCA
+components per block fit on train samples, split seed 0), predictor seeds 0, 1, 2 (`outputs/predictor*_beta`).
+Everything else in section 1 (splits, probe mask, seeds, mean over seeds) is unchanged.
+Applied mechanically by `scripts/10_decide.py --space beta` -> `outputs/decision_beta.json`.
+
+| Rung | Pass criterion |
+|---|---|
+| B1 | as rung 1, on the beta-space predictors |
+| B2 | as rung 2; the comparator is the beta-space `Z - tissue mean` (tissue-centred PCA scores) |
+| B3 | as rung 3, **and** batch: restricted to queries whose lung and colon samples share neither a plate nor a Sentrix chip (if fewer than 20 such donors: those that share no chip; if still fewer than 20, NOT EVALUATED), top-1 after the full covariate model is >= 5/153 and >= 50% of the all-query top-1 after the same model, both directions. The same-donor vs different-donor plate and chip sharing rates are reported. |
+| B4 | as rung 4, with the residual score's percentile taken within (block, decile of the site's train-sample beta variance) instead of within block, for both the any-tissue mQTL set (background: tested CpGs) and the age/tissue negative set. The within-block version is reported. |
+| B4c | cross-tissue concordance: for the 200 strongest mQTL CpGs (stage 07 part 3) and one variance-matched control per CpG (tested, not significant in any table, same block, nearest train-beta variance), Spearman over lung+colon test donors between the donor's lung and colon residual contribution g. Pass: median rho at mQTL CpGs > 0, above the controls' median, one-sided Mann-Whitney p < 0.01. The same statistic on raw betas is reported as the input reference. Part of B4: B4 passes only if B4c passes. |
+| B5 | as rung 5 |
+| B6 | as rung 6 (stage 08 on the beta-space encodings) |
+| Leakage | as section 6: beta-space residual on the unmasked encodings vs the masked ones (seed 0), same rule |
+
+Interpretation, fixed in advance: B1 to B3 pass means "a donor-specific subspace exists in methylation residuals and
+is not plate, chip or measured covariates". B4 (with B4c) and B5 passing as well means "it is genetic". A leakage
+excess means SNP-affected probes carry part of it and is reported next to whatever the ladder says. Failing B3
+means the beta-space match is not shown to be donor biology, and is reported as such.

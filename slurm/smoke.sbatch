@@ -26,4 +26,8 @@ run_stage scripts/06_covariates.py --smoke --encodings "$S/encodings" --pred "$S
 run_stage scripts/07_mqtl_deep.py --smoke --encodings "$S/encodings" --pred "$S/predictor" --out "$S/experiments/mqtl_deep"
 run_stage scripts/08_structure.py --smoke --encodings "$S/encodings" --pred "$S/predictor" --out "$S/experiments/structure"
 run_stage scripts/10_decide.py --smoke
+# beta-space ladder (docs/PREREG.md amendment A1); 08 is not repeated here
+run_stage scripts/06_covariates.py --smoke --encodings "$S/encodings_beta" --pred "$S/predictor_beta" --out "$S/experiments_beta/covariates"
+run_stage scripts/07_mqtl_deep.py --smoke --encodings "$S/encodings_beta" --pred "$S/predictor_beta" --out "$S/experiments_beta/mqtl_deep"
+run_stage scripts/10_decide.py --smoke --space beta
 run_stage scripts/09_train_lewm.py --smoke --encodings "$S/encodings" --out-root "$S/lewm" --lam 0.1
