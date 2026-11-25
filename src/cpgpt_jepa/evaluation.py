@@ -188,15 +188,53 @@ def lung_colon_sets(run: Run) -> dict[str, np.ndarray]:
 
 
 def donor_matching(run: Run, rep: np.ndarray, blocks: np.ndarray | None = None, n_perm: int = 0,
-                   seed: int = 0) -> dict:
+                   seed: int = 0, query_donors: np.ndarray | None = None) -> dict:
     """Lung->colon and colon->lung matching. rep is samples x blocks x d (flattened over `blocks`,
-    default the autosomal blocks) or samples x features."""
+    default the autosomal blocks) or samples x features. query_donors restricts the queries (not the
+    galleries) to those donors."""
     if rep.ndim == 3:
         rep = rep[:, run.auto_blocks if blocks is None else blocks]
     rep = rep.reshape(len(rep), -1)
     s = lung_colon_sets(run)
-    return {"lung_to_colon": retrieval(rep, run.donor, s["lung_q"], s["colon"], n_perm, seed),
-            "colon_to_lung": retrieval(rep, run.donor, s["colon_q"], s["lung"], n_perm, seed)}
+    lq, cq = s["lung_q"], s["colon_q"]
+    if query_donors is not None:
+        lq, cq = lq[np.isin(run.donor[lq], query_donors)], cq[np.isin(run.donor[cq], query_donors)]
+    return {"lung_to_colon": retrieval(rep, run.donor, lq, s["colon"], n_perm, seed),
+            "colon_to_lung": retrieval(rep, run.donor, cq, s["lung"], n_perm, seed)}
+
+
+# --- batch confounding (docs/PREREG.md amendment A1, rung B3) ------------------------------------
+def batch_sharing(run: Run, keys: tuple[str, ...]) -> dict:
+    """For the lung+colon test donors: fraction whose lung and colon samples share a value of every key in
+    `keys` (e.g. ("plate",), ("sentrix_id",)), against the same fraction over lung/colon pairs of different
+    donors (the rate a batch effect would need to beat to help matching)."""
+    s = lung_colon_sets(run)
+    meta = run.meta.reset_index(drop=True)
+    val = meta[list(keys)].astype(str).agg("|".join, axis=1).to_numpy()
+    lung, colon = s["lung_q"], s["colon"]
+    same = np.array([val[i] in set(val[colon[run.donor[colon] == run.donor[i]]]) for i in lung
+                     if (run.donor[colon] == run.donor[i]).any()])
+    diff_pairs = val[lung][:, None] == val[colon][None, :]
+    other = run.donor[lung][:, None] != run.donor[colon][None, :]
+    return {"keys": list(keys), "n_donors": int(len(same)),
+            "same_donor_shared": float(same.mean()) if len(same) else float("nan"),
+            "different_donor_shared": float(diff_pairs[other].mean()) if other.any() else float("nan")}
+
+
+def cross_batch_donors(run: Run, keys: tuple[str, ...]) -> np.ndarray:
+    """Lung+colon test donors none of whose lung samples shares a value of any key in `keys` with any of
+    their colon samples (so a batch effect cannot carry the true match)."""
+    s = lung_colon_sets(run)
+    meta = run.meta.reset_index(drop=True)
+    out = []
+    for dn in np.unique(run.donor[s["lung_q"]]):
+        li = s["lung"][run.donor[s["lung"]] == dn]
+        ci = s["colon"][run.donor[s["colon"]] == dn]
+        if len(ci) == 0:
+            continue
+        if all(set(meta[k].astype(str).to_numpy()[li]).isdisjoint(meta[k].astype(str).to_numpy()[ci]) for k in keys):
+            out.append(dn)
+    return np.array(out, dtype=object)
 
 
 def tissue_centred(run: Run, Zs: np.ndarray) -> np.ndarray:
@@ -241,6 +279,53 @@ def percentile_within_block(score: np.ndarray, block_of: np.ndarray) -> np.ndarr
         m = block_of == b
         pct[m] = (rankdata(score[m]) - 0.5) / m.sum()
     return pct
+
+
+def percentile_within_block_and_variance(score: np.ndarray, block_of: np.ndarray, site_var: np.ndarray,
+                                         n_bins: int = 10) -> np.ndarray:
+    """Percentile of score within (block, decile of site_var within that block): a site is compared only
+    with sites of its own block whose input variance is similar (docs/PREREG.md amendment A1, rung B4).
+    site_var is the train-sample variance of the site's betas."""
+    pct = np.empty(len(score))
+    for b in np.unique(block_of):
+        m = np.flatnonzero(block_of == b)
+        v = site_var[m]
+        edges = np.quantile(v, np.linspace(0, 1, n_bins + 1)[1:-1])
+        bins = np.searchsorted(edges, v, side="right")
+        for k in np.unique(bins):
+            mk = m[bins == k]
+            pct[mk] = (rankdata(score[mk]) - 0.5) / len(mk)
+    return pct
+
+
+def variance_matched_controls(set_rows: np.ndarray, cand_rows: np.ndarray, block_of: np.ndarray,
+                              site_var: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """One control per set row: the candidate in the same block with the nearest log variance, drawn
+    without replacement (ties broken at random). Rows with no candidate left in their block get none."""
+    used = np.zeros(len(block_of), dtype=bool)
+    out = []
+    logv = np.log(site_var + 1e-12)
+    for r in rng.permutation(set_rows):
+        c = cand_rows[(block_of[cand_rows] == block_of[r]) & ~used[cand_rows]]
+        if len(c) == 0:
+            continue
+        pick = c[np.argmin(np.abs(logv[c] - logv[r]) + 1e-9 * rng.random(len(c)))]
+        used[pick] = True
+        out.append(pick)
+    return np.array(out, dtype=int)
+
+
+def cross_tissue_concordance(g_lung: np.ndarray, g_colon: np.ndarray) -> np.ndarray:
+    """Per site (column), Spearman correlation over donors (rows, aligned) between the lung and colon
+    values. NaN for a constant column."""
+    from scipy.stats import spearmanr
+
+    rho = np.full(g_lung.shape[1], np.nan)
+    for j in range(g_lung.shape[1]):
+        a, b = g_lung[:, j], g_colon[:, j]
+        if np.ptp(a) > 0 and np.ptp(b) > 0:
+            rho[j] = spearmanr(a, b).statistic
+    return rho
 
 
 def enrichment(pct: np.ndarray, is_set: np.ndarray, top: float = 0.95) -> dict:

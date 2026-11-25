@@ -15,6 +15,12 @@ PREREG says so (every criterion), statistics are averaged over the seeds that ha
 odds ratios, Spearman rho and bootstrap CI bounds are each the mean over seeds; per-seed values are kept too.
 Secondary p-values are Holm-corrected within each rung (the lung->colon permutation p of rung 2 is the primary
 endpoint and is not corrected). Writes <outputs>/decision.json and prints a table.
+
+--space beta applies the beta-space ladder of docs/PREREG.md amendment A1 instead: every directory gets the
+suffix _beta (<pred>_beta, <exp>_beta, predictor_unmasked_beta), the beta-space rule is replaced by the CpGPT
+comparison, and three criteria are added: B3 cross-batch matching (stage 06 "batch"), B4 uses the
+variance-matched enrichment of stage 07 for the mQTL and negative sets, B4c cross-tissue concordance (stage 07).
+Writes <outputs>/decision_beta.json.
 """
 import argparse
 import json
@@ -35,6 +41,8 @@ p.add_argument("--seeds", default="0,1,2")
 p.add_argument("--kind", default="mlp_joint", help="primary predictor (docs/PREREG.md section 1)")
 p.add_argument("--n-boot", type=int, default=10_000)
 p.add_argument("--out", default=None, help="default <outputs>/decision.json")
+p.add_argument("--space", choices=("cpgpt", "beta"), default="cpgpt",
+               help="cpgpt: the frozen ladder; beta: the beta-space ladder of docs/PREREG.md amendment A1")
 p.add_argument("--smoke", action="store_true", help="outputs/smoke, seed 0; missing outputs are expected")
 args = p.parse_args()
 if args.smoke:
@@ -46,15 +54,17 @@ K = args.kind
 DIRS = ("lung_to_colon", "colon_to_lung")
 TOP1_MIN = 5 / 153  # rung 2 chance criterion, docs/PREREG.md section 4
 PASS, FAIL, NE = "PASS", "FAIL", "NOT EVALUATED"
+BETA = args.space == "beta"
+SUF = "_beta" if BETA else ""
 
 
 # --- loading -------------------------------------------------------------------------------------
-def pred_dir(s: int) -> Path:
-    return root / ("predictor" if s == 0 else f"predictor_seed{s}")
+def pred_dir(s: int, suffix: str = SUF) -> Path:
+    return root / (("predictor" if s == 0 else f"predictor_seed{s}") + suffix)
 
 
 def exp_dir(s: int) -> Path:
-    return root / ("experiments" if s == 0 else f"experiments_seed{s}")
+    return root / (("experiments" if s == 0 else f"experiments_seed{s}") + SUF)
 
 
 def load(path: Path) -> dict | None:
@@ -62,11 +72,12 @@ def load(path: Path) -> dict | None:
 
 
 ev = {s: load(pred_dir(s) / K / "evaluation.json") for s in seeds}
-ev_beta = {s: load(Path(f"{pred_dir(s)}_beta") / K / "evaluation.json") for s in seeds}
+ev_beta = {s: load(pred_dir(s, "_beta") / K / "evaluation.json") for s in seeds}
+ev_cpgpt = {s: load(pred_dir(s, "") / K / "evaluation.json") for s in seeds}
 cov = {s: load(exp_dir(s) / "covariates" / "result.json") for s in seeds}
 mq = {s: load(exp_dir(s) / "mqtl_deep" / "result.json") for s in seeds}
 st = {s: load(exp_dir(s) / "structure" / "result.json") for s in seeds}
-ev_unmasked = load(root / "predictor_unmasked" / K / "evaluation.json")
+ev_unmasked = load(root / f"predictor_unmasked{SUF}" / K / "evaluation.json")
 inputs = {"stage04": {s: v is not None for s, v in ev.items()},
           "stage04_beta": {s: v is not None for s, v in ev_beta.items()},
           "stage06": {s: v is not None for s, v in cov.items()},
@@ -121,7 +132,9 @@ def missing(what: str) -> dict:
     return rung(NE, {}, {}, f"missing output: {what}")
 
 
-decision = {"outputs": str(root), "seeds": seeds, "kind": K, "inputs_found": inputs, "rungs": {}}
+decision = {"outputs": str(root), "space": args.space, "seeds": seeds, "kind": K, "inputs_found": inputs, "rungs": {}}
+if BETA:
+    decision["rules"] = "docs/PREREG.md amendment A1 (beta-space ladder)"
 R = decision["rungs"]
 
 # --- rung 1: predictor non-trivial ---------------------------------------------------------------
@@ -185,18 +198,40 @@ else:
         checks[f"{d}: top1 after >= 5/153"] = None if after is None else after >= TOP1_MIN
         checks[f"{d}: perm p after (Holm) < 0.01"] = None if adj.get(d) is None else adj[d] < 0.01
         checks[f"{d}: keeps >= 50% of pre-regression top1"] = None if frac is None else frac >= 0.5
+    if BETA:  # amendment A1, B3: the match must survive on donors whose lung and colon share no plate or chip
+        nb = {s: v for s, v in cov.items() if v and isinstance(v.get("batch"), dict)}
+        skipped = [v["batch"]["skipped"] for v in nb.values() if "skipped" in v["batch"]]
+        batch = {"keys": next((v["batch"]["cross_batch_keys"] for v in nb.values()), None),
+                 "n_cross_batch_donors": mean({s: v["batch"]["n_cross_batch_donors"] for s, v in nb.items()}),
+                 "sharing": next((v["batch"]["sharing"] for v in nb.values()), None)}
+        for d in DIRS:
+            xb = None if (not nb or skipped) else mean(per_seed(cov, "batch", "M4 +PEER within tissue", d, "top1"))
+            allq = nums[d]["top1_after"]
+            batch[d] = {"top1_cross_batch_after": xb, "top1_all_after": allq,
+                        "fraction": xb / allq if (xb is not None and allq) else None}
+            checks[f"{d}: cross-batch top1 after >= 5/153"] = None if xb is None else xb >= TOP1_MIN
+            checks[f"{d}: cross-batch top1 after >= 50% of all-query top1 after"] = (
+                None if batch[d]["fraction"] is None else batch[d]["fraction"] >= 0.5)
+        if skipped:
+            batch["skipped"] = skipped
+        nums["batch"] = batch
     covs = get(next(v for v in cov.values() if v), "covariate_columns")
     R["3"] = rung(verdict(checks), checks, {**nums, "covariate_model": FINAL, "covariate_columns": covs},
                   "" if covs and "smoking" in covs else "WARNING: smoking is not among the stage 06 covariates")
 
 # --- rung 4: genetic in the specific sense -------------------------------------------------------
 KEY = "any list / all test samples"
-e4 = {s: v for s, v in per_seed(ev, "mqtl", KEY, "variance").items()}
 NEG, POS7 = "negative (age/tissue, not mQTL) / all test", "any tissue / all test"
-neg = per_seed(mq, "enrichment", NEG)
-pos7 = per_seed(mq, "enrichment", POS7)
+ENR = "enrichment_variance_matched" if BETA else "enrichment"  # amendment A1, B4
+if BETA:  # mQTL set: stage 07 any-tissue set, percentile within (block, variance decile)
+    e4 = per_seed(mq, ENR, POS7)
+else:
+    e4 = {s: v for s, v in per_seed(ev, "mqtl", KEY, "variance").items()}
+neg = per_seed(mq, ENR, NEG)
+pos7 = per_seed(mq, ENR, POS7)
 if not e4:
-    R["4"] = missing("stage 04 mQTL enrichment ('any list / all test samples')")
+    R["4"] = missing("stage 07 variance-matched enrichment ('any tissue / all test')" if BETA
+                     else "stage 04 mQTL enrichment ('any list / all test samples')")
 else:
     pct = mean({s: v["mean_pct_set"] for s, v in e4.items()})
     pct_other = mean({s: v["mean_pct_other"] for s, v in e4.items()})
@@ -209,7 +244,8 @@ else:
               "top-5% OR > 1": orr > 1, "Fisher p (Holm) < 0.01": adj.get("fisher", 1) < 0.01}
     nums = {"mqtl_set": {"mean_pct_set": pct, "mean_pct_other": pct_other, "mannwhitney_p": mw, "fisher_p": fp,
                          "holm": adj, "odds_ratio": orr, "or_ci95": or_ci,
-                         "background": get(next(iter(per_seed(ev, "mqtl", KEY).values()), None), "background"),
+                         "background": (get(next(iter(e4.values()), None), "background") if BETA else
+                                        get(next(iter(per_seed(ev, "mqtl", KEY).values()), None), "background")),
                          "per_seed": e4}}
     if not neg or not pos7 or not all("top5_log_or" in v for v in list(neg.values()) + list(pos7.values())):
         checks["negative set not enriched"] = None
@@ -230,6 +266,24 @@ else:
                                 "diff_ci95": diff_ci, "significantly_below_mqtl": below,
                                 "mqtl_set_stage07_odds_ratio": mean({s: v["top5_odds_ratio"] for s, v in pos7.items()}),
                                 "seeds": sd}
+    if BETA:  # amendment A1, B4c: genotype-like concordance across a donor's tissues
+        cc = {s: v["concordance"] for s, v in mq.items() if v and isinstance(v.get("concordance"), dict)}
+        if not cc:
+            checks["concordance: mQTL median rho > 0"] = None
+            checks["concordance: mQTL > variance-matched control (MW p < 0.01)"] = None
+            nums["concordance"] = "missing: stage 07 concordance"
+        else:
+            rm = mean({s: v["strongest mQTL"]["median_rho_residual"] for s, v in cc.items()})
+            rc = mean({s: v["variance-matched control"]["median_rho_residual"] for s, v in cc.items()})
+            pc = mean({s: v["mannwhitney_p_mqtl_gt_control"] for s, v in cc.items()})
+            checks["concordance: mQTL median rho > 0"] = rm > 0
+            checks["concordance: mQTL > variance-matched control (MW p < 0.01)"] = rm > rc and pc < 0.01
+            nums["concordance"] = {
+                "median_rho_mqtl": rm, "median_rho_control": rc, "mannwhitney_p": pc,
+                "median_rho_raw_betas_mqtl": mean({s: v["strongest mQTL"]["median_rho_raw_betas"] for s, v in cc.items()}),
+                "median_rho_raw_betas_control": mean({s: v["variance-matched control"]["median_rho_raw_betas"]
+                                                      for s, v in cc.items()}),
+                "n_donors": mean({s: v["n_donors"] for s, v in cc.items()})}
     R["4"] = rung(verdict(checks), checks, nums)
 
 # --- rung 5: structured where it should be -------------------------------------------------------
@@ -261,9 +315,14 @@ else:
     R["6"] = rung(verdict(checks), checks, {**nums, "struct_tracks": per_seed(st, "struct_tracks")}, note)
 
 # --- beta-space decision rule --------------------------------------------------------------------
-bs = {d: {"diff": mean(per_seed(ev, "inference", "R vs beta-space R", d, "diff")),
-          "ci95": mean(per_seed(ev, "inference", "R vs beta-space R", d, "ci95"))} for d in DIRS}
-if any(v["ci95"] is None for v in bs.values()):
+src_bs = ev_cpgpt if BETA else ev  # the comparison lives in the CpGPT stage 04 output
+bs = {d: {"diff": mean(per_seed(src_bs, "inference", "R vs beta-space R", d, "diff")),
+          "ci95": mean(per_seed(src_bs, "inference", "R vs beta-space R", d, "ci95"))} for d in DIRS}
+if BETA:
+    decision["beta_space"] = {"status": "CONTEXT", "note": "beta-space ladder: CpGPT residual minus beta-space residual "
+                                                           "(CpGPT stage 04), reported for context",
+                              "R_minus_beta_R": bs, "cpgpt_residual": matching_numbers(ev_cpgpt, "residual R")}
+elif any(v["ci95"] is None for v in bs.values()):
     decision["beta_space"] = {"status": NE, "note": "missing 'R vs beta-space R' in stage 04 (run 03/04 --beta-space first)"}
 else:
     cpgpt_better = {d: bs[d]["ci95"][0] > 0 for d in DIRS}
@@ -327,17 +386,18 @@ else:
 
 # --- interpretation (section 4, fixed in advance) ------------------------------------------------
 st_ = {k: v["status"] for k, v in R.items()}
+what = "beta-space (per-block PCA) residuals" if BETA else "frozen CpGPT block residuals"
 if st_.get("2") == FAIL:
-    interp = "Rung 2 fails: frozen CpGPT block residuals do not identify donors (negative result)."
+    interp = f"Rung 2 fails: {what} do not identify donors (negative result)."
 elif all(st_.get(k) == PASS for k in "123"):
-    interp = "Rungs 1-3 pass: a donor-specific subspace exists."
+    interp = f"Rungs 1-3 pass: a donor-specific subspace exists in {what}."
     if st_.get("4") == PASS and st_.get("5") == PASS:
         interp += " Rungs 4-5 pass as well: it is genetic."
 else:
     interp = "The ladder is incomplete: " + ", ".join(f"rung {k} {v}" for k, v in st_.items() if v != PASS) + "."
 decision["interpretation"] = interp
 
-out_path = Path(args.out) if args.out else root / "decision.json"
+out_path = Path(args.out) if args.out else root / f"decision{SUF}.json"
 out_path.write_text(json.dumps(decision, indent=2, default=float))
 
 
@@ -346,7 +406,7 @@ def f(x, spec=".3f"):
     return "NA" if x is None else (f"[{x[0]:{spec}}, {x[1]:{spec}}]" if isinstance(x, list) else f"{x:{spec}}")
 
 
-print(f"\n=== 10 DECISION (docs/PREREG.md; kind {K}; seeds {seeds}; outputs {root}) ===")
+print(f"\n=== 10 DECISION (docs/PREREG.md{' amendment A1, beta space' if BETA else ''}; kind {K}; seeds {seeds}; outputs {root}) ===")
 print(f"inputs found: {json.dumps(inputs)}")
 for k in "123456":
     r = R[k]
@@ -366,11 +426,20 @@ if n:
     for d in DIRS:
         print(f"   rung 3 {d}: top1 {f(n[d]['top1_before'])} -> {f(n[d]['top1_after'])} (kept {f(n[d]['fraction_kept'])}), "
               f"perm p (Holm) {f(n[d]['perm_p_after_holm'], '.4f')}")
+    if "batch" in n:
+        bt = n["batch"]
+        print(f"   rung 3 batch ({bt['keys']}, {f(bt['n_cross_batch_donors'], '.0f')} donors): " + ", ".join(
+            f"{d} {f(bt[d]['top1_cross_batch_after'])} (of {f(bt[d]['top1_all_after'])})" for d in DIRS))
 n = R["4"]["numbers"]
 if n:
     q = n["mqtl_set"]
     print(f"   rung 4 mQTL: pct {f(q['mean_pct_set'], '.4f')} vs {f(q['mean_pct_other'], '.4f')}, MW p {f(q['mannwhitney_p'], '.2e')}, "
           f"OR {f(q['odds_ratio'])} CI {f(q['or_ci95'])}, Fisher p {f(q['fisher_p'], '.2e')}; Holm {json.dumps(q['holm'])}")
+    if isinstance(n.get("concordance"), dict):
+        c = n["concordance"]
+        print(f"   rung 4c concordance: median rho mQTL {f(c['median_rho_mqtl'])} vs control {f(c['median_rho_control'])}, "
+              f"MW p {f(c['mannwhitney_p'], '.2e')}; raw betas {f(c['median_rho_raw_betas_mqtl'])} vs "
+              f"{f(c['median_rho_raw_betas_control'])}")
     if isinstance(n["negative_set"], dict):
         g = n["negative_set"]
         print(f"   rung 4 negative set: OR {f(g['odds_ratio'])} CI {f(g['or_ci95'])}; log OR minus mQTL's "
@@ -384,7 +453,7 @@ if n:
         print(f"   rung 6 {d}: {K} {f(n[d]['top1_' + K])}, {K}_struct {f(n[d]['top1_' + K + '_struct'])} (kept {f(n[d]['fraction_kept'])})")
 b = decision["beta_space"]
 print(f"\nBeta-space rule: {b['status']}")
-if "R_minus_beta_R" in b:
+if "R_minus_beta_R" in b and not BETA:
     for d in DIRS:
         print(f"   {d}: CpGPT R - beta R top1 {f(b['R_minus_beta_R'][d]['diff'])} CI {f(b['R_minus_beta_R'][d]['ci95'])}; "
               f"beta R top1 {f(b['beta_space_residual'][d]['top1'])}; raw betas {f(b['raw_betas'][d]['top1'])}, "

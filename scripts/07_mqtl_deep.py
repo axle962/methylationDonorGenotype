@@ -9,6 +9,12 @@
 3. Tri-modality: residual contribution g of the 200 strongest mQTL CpGs across test donors; Gaussian
    mixture BIC, 1 vs 3 components; 200 random non-mQTL sites from the same blocks as control.
 4. chrX positive control (stage 2 --include-x): donor matching and sex prediction from chrX vs autosomal blocks.
+5. Cross-tissue concordance (docs/PREREG.md amendment A1, rung B4c): for each of the strongest mQTL CpGs and for
+   variance-matched controls (tested, not significant in any table, same block, nearest train-beta variance),
+   Spearman over lung+colon test donors between the donor's lung and colon residual contribution g; the same on
+   the raw betas as the input reference.
+Part 1 is also reported with the score's percentile taken within (block, decile of train-beta variance) instead of
+within block ("enrichment_variance_matched", amendment A1, rung B4).
 Needs the frozen-CpGPT decoder vectors (W.mmap); Phase B encodings skip parts 1 and 3.
 """
 import argparse
@@ -29,18 +35,21 @@ from cpgpt_jepa.blocks import open_processed  # noqa: E402
 from cpgpt_jepa.evaluation import (  # noqa: E402
     COLON,
     LUNG,
+    cross_tissue_concordance,
     donor_matching,
     enrichment,
     fmt,
-    lung_colon_sets,
     load_run,
+    lung_colon_sets,
     percentile_within_block,
+    percentile_within_block_and_variance,
     rank_of_true,
     ranks_to_metrics,
     read_set,
     site_g,
     site_scores,
     tested_cpgs,
+    variance_matched_controls,
     write_outputs,
 )
 
@@ -89,6 +98,8 @@ if has_w:
     Xtr = np.asarray(X_mm[sample_rows[run.train_s]])[:, site_cols]  # float32, train samples x block sites
     col_mean = np.nanmean(Xtr, axis=0)
     Xtr = np.where(np.isnan(Xtr), col_mean, Xtr)
+    var_of_row = np.full(len(run.W_block), np.nan)  # train-sample variance of each W row's betas
+    var_of_row[auto_rows] = Xtr.var(0)
 
     def anova_f(groups: np.ndarray) -> np.ndarray:
         labels = [g for g in pd.unique(groups) if g != "NA"]
@@ -117,7 +128,8 @@ if has_w:
                                                ("negative (age/tissue, not mQTL)", "lung test"),
                                                ("negative (age/tissue, not mQTL)", "colon test")]
     pct_cache = {}
-    result["enrichment"] = {}
+    result["enrichment"], result["enrichment_variance_matched"] = {}, {}
+    pct_m_cache = {}
     for set_name, samp_name in pairs:
         samples = sample_sets[samp_name]
         if len(samples) < 2:
@@ -125,13 +137,20 @@ if has_w:
         if samp_name not in pct_cache:
             w_rows, var_g, _ = site_scores(run, R, samples)
             pct_cache[samp_name] = (w_rows, percentile_within_block(var_g, run.W_block[w_rows]))
+            pct_m_cache[samp_name] = percentile_within_block_and_variance(var_g, run.W_block[w_rows], var_of_row[w_rows])
         w_rows, pct = pct_cache[samp_name]
+        pct_m = pct_m_cache[samp_name]
         probes = run.site_probes[w_rows]
         bg = np.isin(probes, sorted(universe[set_name])) if set_name in universe else np.ones(len(probes), bool)
         e = enrichment(pct[bg], np.isin(probes[bg], sorted(sets[set_name])))
         e["background"] = "CpGs tested in the mQTL table(s)" if set_name in universe else "all block sites"
         result["enrichment"][f"{set_name} / {samp_name}"] = e
         rows.append({"analysis": "enrichment", "set": set_name, "samples": samp_name, **{k: v for k, v in e.items() if k != "top5_table"}})
+        em = enrichment(pct_m[bg], np.isin(probes[bg], sorted(sets[set_name])))
+        em["background"] = e["background"] + "; percentile within (block, train-beta variance decile)"
+        result["enrichment_variance_matched"][f"{set_name} / {samp_name}"] = em
+        rows.append({"analysis": "enrichment_variance_matched", "set": set_name, "samples": samp_name,
+                     **{k: v for k, v in em.items() if k != "top5_table"}})
     print(f"[1] enrichment done ({time.time() - t0:.0f}s)", flush=True)
 else:
     result["enrichment"] = "skipped: no per-site decoder vectors (W.mmap)"
@@ -231,8 +250,51 @@ if has_w:
             rows.append({"analysis": "trimodality", "set": set_name, "samples": samp_name, "fraction_prefer_3": frac,
                          "n_sites": n})
     print(f"[3] tri-modality done ({time.time() - t0:.0f}s)", flush=True)
+
+    # --- 5. cross-tissue concordance of g at the strongest mQTL CpGs (amendment A1, rung B4c) ---------------
+    from scipy.stats import mannwhitneyu
+
+    s5 = lung_colon_sets(run)
+    pairs5 = [(li, s5["colon"][run.donor[s5["colon"]] == run.donor[li]][0]) for li in s5["lung_q"]
+              if (run.donor[s5["colon"]] == run.donor[li]).any()]
+    seen, pairs_u = set(), []
+    for li, ci in pairs5:  # one pair per donor
+        if run.donor[li] not in seen:
+            seen.add(run.donor[li])
+            pairs_u.append((li, ci))
+    tested_all = np.isin(run.site_probes, sorted(tested_cpgs(egtex)))
+    cand5 = auto_rows[tested_all[auto_rows] & ~np.isin(run.site_probes[auto_rows], sorted(any_set))]
+    ctrl5 = variance_matched_controls(mq_rows, cand5, run.W_block, var_of_row, np.random.default_rng(args.seed))
+    if len(pairs_u) >= 5 and len(mq_rows) and len(ctrl5):
+        li_idx, ci_idx = np.array([a for a, _ in pairs_u]), np.array([b for _, b in pairs_u])
+        W_index = np.load(run.enc / "W_index.npy")
+        cols5 = W_index[np.concatenate([mq_rows, ctrl5]), 0]
+        X_lc = np.stack([X_mm[r, cols5] for r in sample_rows[np.concatenate([li_idx, ci_idx])]])  # needed columns only
+        col_of = {c: j for j, c in enumerate(cols5)}
+        conc = {"n_donors": len(pairs_u), "n_mqtl_sites": int(len(mq_rows)), "n_control_sites": int(len(ctrl5)),
+                "control": "tested, not significant in any table, same block, nearest train-beta variance"}
+        for name, w_rows in (("strongest mQTL", mq_rows), ("variance-matched control", ctrl5)):
+            rho_g = cross_tissue_concordance(site_g(run, R, li_idx, w_rows), site_g(run, R, ci_idx, w_rows))
+            xb = X_lc[:, [col_of[c] for c in W_index[w_rows, 0]]]
+            xb = np.where(np.isnan(xb), np.nanmean(xb, axis=0), xb)
+            rho_b = cross_tissue_concordance(xb[: len(li_idx)], xb[len(li_idx):])
+            conc[name] = {"median_rho_residual": float(np.nanmedian(rho_g)), "median_rho_raw_betas": float(np.nanmedian(rho_b)),
+                          "rho_residual": rho_g.tolist(), "rho_raw_betas": rho_b.tolist()}
+        a = np.array(conc["strongest mQTL"]["rho_residual"])
+        b = np.array(conc["variance-matched control"]["rho_residual"])
+        conc["mannwhitney_p_mqtl_gt_control"] = float(mannwhitneyu(a[np.isfinite(a)], b[np.isfinite(b)],
+                                                                    alternative="greater").pvalue)
+        result["concordance"] = conc
+        rows.append({"analysis": "concordance", "set": "strongest mQTL vs control", "samples": "lung/colon donors",
+                     "median_rho_mqtl": conc["strongest mQTL"]["median_rho_residual"],
+                     "median_rho_control": conc["variance-matched control"]["median_rho_residual"],
+                     "p": conc["mannwhitney_p_mqtl_gt_control"]})
+    else:
+        result["concordance"] = f"skipped: {len(pairs_u)} lung/colon donor pairs, {len(mq_rows)} mQTL sites, {len(ctrl5)} controls"
+    print(f"[5] concordance done ({time.time() - t0:.0f}s)", flush=True)
 else:
     result["trimodality"] = "skipped: no per-site decoder vectors (W.mmap)"
+    result["concordance"] = "skipped: no per-site decoder vectors (W.mmap)"
 
 # --- 4. chrX positive control ------------------------------------------------------------------
 x_blocks = np.flatnonzero(run.block_chrom == "X")
@@ -270,6 +332,10 @@ if isinstance(result["enrichment"], dict):
         print(f"   {k:<46s}{e['n_set']:>8d}{fmt(e['mean_pct_set'], '.4f'):>9s}{fmt(e['mean_pct_other'], '.4f'):>9s}"
               f"{fmt(e['mannwhitney_p'], '.2e'):>10s}{fmt(e['top5_odds_ratio']):>10s}{fmt(e['top5_fisher_p'], '.2e'):>10s}")
     print(f"   negative set: {json.dumps(result['negative_set'])}")
+    print("1b. Same, percentile within (block, train-beta variance decile)")
+    for k, e in result["enrichment_variance_matched"].items():
+        print(f"   {k:<46s}{e['n_set']:>8d}{fmt(e['mean_pct_set'], '.4f'):>9s}{fmt(e['mean_pct_other'], '.4f'):>9s}"
+              f"{fmt(e['mannwhitney_p'], '.2e'):>10s}{fmt(e['top5_odds_ratio']):>10s}{fmt(e['top5_fisher_p'], '.2e'):>10s}")
 else:
     print(f"1. {result['enrichment']}")
 bc = result.get("block_contribution")
@@ -296,5 +362,13 @@ if isinstance(result["chrX"], dict):
               f"  sex accuracy {fmt(v.get('sex_accuracy_test', float('nan')))}")
 else:
     print(f"4. {result['chrX']}")
+c5 = result["concordance"]
+if isinstance(c5, dict):
+    print(f"5. Cross-tissue concordance over {c5['n_donors']} donors (median Spearman, lung vs colon):")
+    for k in ("strongest mQTL", "variance-matched control"):
+        print(f"   {k:<26s} residual g {fmt(c5[k]['median_rho_residual'])}   raw betas {fmt(c5[k]['median_rho_raw_betas'])}")
+    print(f"   Mann-Whitney p (mQTL > control, residual): {fmt(c5['mannwhitney_p_mqtl_gt_control'], '.2e')}")
+else:
+    print(f"5. {c5}")
 print(f"elapsed: {time.time() - t0:.0f}s")
 finish(True)
