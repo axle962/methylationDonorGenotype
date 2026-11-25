@@ -33,6 +33,7 @@ from cpgpt_jepa.blocks import (  # noqa: E402
     find_dataset_dir,
     open_dna_embeddings,
     open_processed,
+    pad_inputs,
     pearson,
 )
 
@@ -55,7 +56,15 @@ p.add_argument("--probe-mask", default="data/annotations/EPIC.hg38.mask.tsv.gz",
 p.add_argument("--mask-column", default="M_general")
 p.add_argument("--smoke", action="store_true", help="20 samples x 5 blocks, CPU allowed")
 p.add_argument("--allow-cpu", action="store_true")
+p.add_argument("--bundle", default=None,
+               help="encode with a model bundle (<bundle>/config.yaml + model.ckpt) from the Hugging Face cache, "
+                    "e.g. perceiver_large, instead of the released --model")
+p.add_argument("--bundle-repo", default="dnam-lab/am16489-bundles")
+p.add_argument("--cpgpt-src", default=None,
+               help="put this CpGPT checkout first on sys.path (the code the bundle was made with)")
 args = p.parse_args()
+if args.cpgpt_src:
+    sys.path.insert(0, str(Path(args.cpgpt_src).resolve()))
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if device.type == "cpu" and not (args.smoke or args.allow_cpu):
@@ -71,16 +80,36 @@ out = Path(args.out)
 out.mkdir(parents=True, exist_ok=True)
 
 # --- frozen model ------------------------------------------------------------------------------
-resources = resolve_cached_model(args.model)
 deps_dir = str(resolve_cached_dependencies("human"))
+if args.bundle:
+    from huggingface_hub import hf_hub_download  # noqa: E402
+
+    # local_files_only: the bundle is downloaded once beforehand, so jobs need no token
+    config_path, ckpt_path = (
+        hf_hub_download(args.bundle_repo, f"{args.bundle}/{f}", local_files_only=True)
+        for f in ("config.yaml", "model.ckpt")
+    )
+    model_name = f"{args.bundle_repo}/{args.bundle}"
+else:
+    resources = resolve_cached_model(args.model)
+    config_path, ckpt_path = resources.config_path, resources.checkpoint_path
+    model_name = args.model
+import cpgpt  # noqa: E402
+
+print(f"cpgpt code: {Path(cpgpt.__file__).parent}", flush=True)
 inferencer = CpGPTInferencer(dependencies_dir=deps_dir, data_dir="data")
-config = inferencer.load_cpgpt_config(resources.config_path)
-model = inferencer.load_cpgpt_model(config, model_ckpt_path=resources.checkpoint_path, strict_load=True)
+config = inferencer.load_cpgpt_config(config_path)
+model = inferencer.load_cpgpt_model(config, model_ckpt_path=ckpt_path, strict_load=True)
 model.to(device).eval().requires_grad_(False)
 net = model.net
 d = net.d_embedding
+# Perceiver bundles: the sample embedding is Linear(mean of the latents); the decoder reads the latents
+# and neighbouring sites, not z, so there is no per-site linear decoder. W comes from a post-hoc ridge
+# fit z_B -> block betas on train donors instead (as stage 09 does for LeWM).
+perceiver = getattr(net, "backbone", "transformer") == "perceiver"
 n_params = sum(t.numel() for t in net.parameters())
-print(f"model {args.model}: {n_params / 1e6:.1f}M parameters, d_embedding {d}", flush=True)
+print(f"model {model_name}: {n_params / 1e6:.1f}M parameters, d_embedding {d}, "
+      f"backbone {'perceiver' if perceiver else 'transformer'}", flush=True)
 if config.model.training.get("binarize_input", False):
     print("WARNING: this model was trained with binarize_input; betas are passed unbinarised here")
 
@@ -168,10 +197,11 @@ for b in blocks:
     tb = time.time()
     cols = b["site_cols"]
     seq = encode_sequence(net, dna_of(cols), device)  # (1, n_sites, d), shared across samples
-    with torch.no_grad(), autocast(device):
-        w = net.meth_decoder(seq)[0]
     C[b["block_id"]] = seq[0].float().mean(0).cpu().numpy()
-    W[offset : offset + len(cols)] = w.float().cpu().numpy().astype(np.float16)
+    if not perceiver:  # Perceiver: W is the post-hoc ridge decoder, filled after this loop
+        with torch.no_grad(), autocast(device):
+            w = net.meth_decoder(seq)[0]
+        W[offset : offset + len(cols)] = w.float().cpu().numpy().astype(np.float16)
     W_index[offset : offset + len(cols), 0] = cols
     W_index[offset : offset + len(cols), 1] = b["block_id"]
     offset += len(cols)
@@ -187,9 +217,23 @@ for b in blocks:
         # decode path: query_methylation(z, seq_emb) against the observed betas
         pred = []
         with torch.no_grad(), autocast(device):
-            for i in range(0, n_samples, 64):
-                zi = z[i : i + 64].to(seq.dtype)
-                pred.append(net.query_methylation(zi, seq.expand(len(zi), -1, -1), m_or_beta="beta")[0].float().cpu())
+            if perceiver:
+                # the Perceiver decodes from its context (latents + neighbouring observed sites), not from z
+                ch = torch.from_numpy(np.ascontiguousarray(var[cols, 0])).to(device).unsqueeze(0)
+                ps = torch.from_numpy(np.ascontiguousarray(var[cols, 1])).to(device).unsqueeze(0)
+                for i in range(0, n_samples, 16):
+                    mb = torch.from_numpy(meth[i : i + 16]).to(device)
+                    n_b = mb.size(0)
+                    inputs = pad_inputs(mb, seq.expand(n_b, -1, -1), ch.expand(n_b, -1), ps.expand(n_b, -1))
+                    ctx = net.encode_context(**inputs)
+                    pred.append(net.query_methylation(
+                        ctx["sample_embedding"], inputs["sequence_embeddings"], m_or_beta="beta", context=ctx,
+                        query_chroms=inputs["chroms"], query_positions=inputs["positions"],
+                    )[0].float().cpu())
+            else:
+                for i in range(0, n_samples, 64):
+                    zi = z[i : i + 64].to(seq.dtype)
+                    pred.append(net.query_methylation(zi, seq.expand(len(zi), -1, -1), m_or_beta="beta")[0].float().cpu())
         pred = torch.cat(pred).numpy()
         ok = ~np.isnan(meth)
         r_all = pearson(pred[ok], meth[ok])
@@ -203,6 +247,23 @@ for b in blocks:
               f"{len(cols)} sites  {seconds[-1]:.1f}s", flush=True)
 
 Z.flush()
+decoder_r2 = None
+if perceiver:
+    # Post-hoc linear decoder z_B -> block betas, fit on the train donors of the stage 03 split
+    # (make_splits, split seed 0), so stages 04/07 have a w_i per site for the mQTL tests.
+    from cpgpt_jepa.beta_space import ridge_decoder  # noqa: E402
+    from cpgpt_jepa.predictor import make_splits  # noqa: E402
+
+    meta_s = pd.read_csv(args.metadata, dtype=str).set_index("sample_id").loc[list(obs_names)]
+    chrom_b = np.array([b["chrom"] for b in blocks])
+    splits = make_splits(meta_s.donor_id.to_numpy(), meta_s.tissue.to_numpy(), n_blocks, seed=0,
+                         eval_only_blocks=np.flatnonzero(chrom_b == "X"))
+    offsets = np.concatenate([[0], np.cumsum(sizes)])
+    W_dec, decoder_r2 = ridge_decoder(np.asarray(Z), X[:, W_index[:, 0]], offsets,
+                                      np.array(splits["train_samples"]), np.array(splits["test_samples"]))
+    W[:] = W_dec.astype(np.float16)
+    print(f"post-hoc ridge decoder z_B -> betas: mean test R^2 over blocks {decoder_r2:.3f} "
+          f"({time.time() - t0:.0f}s)", flush=True)
 W.flush()
 np.save(out / "C.npy", C)
 np.save(out / "W_index.npy", W_index)
@@ -219,18 +280,22 @@ np.save(out / "Z_full_sites.npy", full_cols)
 Z_arr = np.load(out / "Z.npy", mmap_mode="r")
 finite = bool(np.isfinite(Z_arr).all() and np.isfinite(C).all() and torch.isfinite(z_full).all())
 meta = {
-    "model": args.model, "d": d, "n_params": n_params, "n_samples": n_samples, "n_blocks": n_blocks,
+    "model": model_name, "d": d, "n_params": n_params, "n_samples": n_samples, "n_blocks": n_blocks,
     "n_x_blocks": n_x, "window_bp": window_bp, "min_sites": args.min_sites, "n_sites_total": n_total,
     "W_shape": [n_total, d], "W_dtype": "float16", "dataset_dir": str(dataset_dir),
     "sample_idx": sample_idx.tolist(), "dna_llm": dna_llm, "dna_context_len": context_len,
     "seed": args.seed, "smoke": args.smoke, "device": device.type,
     "probe_mask": args.probe_mask, "mask_column": args.mask_column if args.probe_mask.lower() != "none" else None,
     "n_masked_sites": n_masked,
+    "model_name": model_name, "cpgpt_src": str(Path(cpgpt.__file__).parent),
+    "backbone": "perceiver" if perceiver else "transformer",
+    "W_kind": "post-hoc ridge decoder: z_B -> block betas, train donors" if perceiver else "meth_decoder(seq)",
+    "ridge_test_r2": decoder_r2,
 }
 (out / "encode_meta.json").write_text(json.dumps(meta, indent=2))
 
 print("\n=== STAGE 2 REPORT ===")
-print(f"model                : {args.model} ({n_params / 1e6:.1f}M parameters, d = {d}), {device.type}")
+print(f"model                : {model_name} ({n_params / 1e6:.1f}M parameters, d = {d}), {device.type}")
 print(f"window               : {window_bp // 1_000_000} Mb  (stage 1 retained {n_sites} probes)")
 print(f"n_blocks             : {n_blocks}  ({n_blocks - n_x} autosomal, {n_x} chrX; >= {args.min_sites} sites)")
 print(f"sites in blocks      : {n_total}")
@@ -238,6 +303,8 @@ print(f"median sites/block   : {int(np.median(sizes))}  (min {sizes.min()}, max 
 print(f"seconds/block        : {np.mean(seconds):.2f}  ({n_samples} samples; total {t_blocks:.0f}s)")
 print(f"Z.npy                : {Z_arr.shape}   C.npy: {C.shape}   W.mmap: {(n_total, d)} fp16   Z_full.npy: {tuple(z_full.shape)}")
 print(f"all finite           : {finite}")
+if decoder_r2 is not None:
+    print(f"ridge decoder R^2    : {decoder_r2:.3f}  (z_B -> block betas, test donors; W for the mQTL tests)")
 print("decode check (Pearson r, query_methylation(z_B, seq_emb) vs observed betas):")
 for bid, chrom, start, n, r_all, r_centred in checks:
     print(f"  block {bid:>3d} chr{chrom}:{start // 1_000_000}Mb  {n} sites   r = {r_all:.3f}   "
