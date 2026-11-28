@@ -100,8 +100,9 @@ Run after rungs 1-5, on the same predictor.
 
 ## 8. Amendment A1 (2026-11-25): beta-space ladder
 
-**Status: written 2026-11-25 on the user's go-ahead for "Plan A". The thresholds below should be read and
-approved before `slurm/run_phase_a_beta.sh` is submitted; the results they govern have not been computed.**
+**Status: written 2026-11-25 on the user's go-ahead for "Plan A". Thresholds approved by the user on
+2026-11-25, unchanged, before `slurm/run_phase_a_beta.sh` was submitted (jobs 43253-43264, same day); none of
+the results they govern had been computed at approval. Outcome: `outputs/decision_beta.json` (REPORT.md task 9).**
 
 **Why.** The CpGPT ladder failed at rung 2. The decisive control (section 3), the same predictor and residual on a
 per-block PCA of the betas, matched donors at top-1 0.745 (lung to colon) and 0.830 (colon to lung). That rule

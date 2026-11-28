@@ -388,7 +388,13 @@ else:
 st_ = {k: v["status"] for k, v in R.items()}
 what = "beta-space (per-block PCA) residuals" if BETA else "frozen CpGPT block residuals"
 if st_.get("2") == FAIL:
-    interp = f"Rung 2 fails: {what} do not identify donors (negative result)."
+    # Say which part failed: identification itself (top-1 and permutation checks) or only the comparator.
+    ident = [v for k, v in R["2"]["criteria"].items() if "above Z - tissue mean" not in k and v is not None]
+    if ident and all(ident):
+        interp = (f"Rung 2 fails on its comparator: {what} identify donors (top-1 and permutation checks pass) "
+                  "but not beyond tissue-centred Z, so the predictor's residual adds nothing (negative result).")
+    else:
+        interp = f"Rung 2 fails: {what} do not identify donors (negative result)."
 elif all(st_.get(k) == PASS for k in "123"):
     interp = f"Rungs 1-3 pass: a donor-specific subspace exists in {what}."
     if st_.get("4") == PASS and st_.get("5") == PASS:

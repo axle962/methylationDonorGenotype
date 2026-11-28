@@ -93,3 +93,98 @@ predictor and residual), so CpGPT's 128-dimensional block embedding discards nea
 
 **Next.** Phase B: train a block encoder that keeps local variation (stage 09, LeWM) and run the same
 ladder on it. Out of this brief's scope; needs the user's go-ahead.
+
+## Task 7: other frozen encoders (2026-11-24 to 11-25, `slurm/run_encoder_chain.sh`)
+
+Perceiver small (job 42723, CPU, 37 min) and Perceiver large (job 42740, A100, 26 min) encoded through stage 02
+`--bundle`, then 03 to 08 for seeds 0 to 2 and 10 (jobs 42739, 42756), all `SANITY_OK`. Unmasked leakage guard
+and the 5/20 Mb ablation were not run for them (NOT EVALUATED).
+
+| Encoder | Rung 1 (MSE below `block_mean`) | Rung 2 top-1 L->C / C->L | Rungs 3-5 | Rung 6 | 3D |
+|---|---|---|---|---|---|
+| CpGPT small | PASS, 17% | 0.015 / 0.035 | FAIL | PASS | not detected |
+| Perceiver small | PASS, 93% | 0.007 / 0.013 | FAIL | PASS | not detected |
+| Perceiver large | PASS, 94% | 0.007 / 0.013 | FAIL | PASS | lung rho -0.098 (p 0.005), "detectable but negligible" |
+
+Both Perceivers fail rung 2 at chance. Their near-complete rung-1 predictability says little is local to a block.
+
+## Task 8: Phase B, LeWM block encoder (stage 09)
+
+**Global SIGReg (array 42697 and resubmission 42944, A100, about 47 min per lambda).** Tasks 1 and 2 of 42697
+requeued about 30 times on `c12m85-a100-1` (node stuck in CONFIGURING about 7 min, then requeued) and were
+resubmitted; `c24m170-a100-2` and the other GPU partitions reject the course account. All three lambdas train
+but fail stage 03: within-block variance of g is 0.0000 (0.0002 at lambda 1), so `block_mean` predicts
+everything and the residual equals standardised Z. SIGReg on z_B pooled over random blocks is satisfied by
+spreading blocks apart, so samples collapse inside a block.
+
+| lambda | decoder R^2 | Z - tissue mean top-1 L->C / C->L | after full covariates (M4) |
+|---|---|---|---|
+| 0.01 | 0.30 | 0.020 / 0.039 | - |
+| 0.1 | 0.56 | 0.046 / 0.065 | - |
+| 1 | 0.56 | 0.281 / 0.268 | 0.072 / 0.052 |
+
+At lambda 1 most of the 0.28 is shared sex/age/smoking: M1 (tissue, sex, age, smoking) leaves 0.118 / 0.111.
+Only 2 of 153 lung/colon pairs share a Sentrix chip and 24 a plate, so the drop at M3 is not chip sharing.
+
+**Within-block SIGReg (`--sigreg-mode within`, 399e0e4; smoke 43140, full array 43141).** Batches are 4 target
+blocks x 16 samples and SIGReg acts on z_B minus its block's batch mean. Collapse is fixed (within-block
+var(z_B) at epoch 20: 0.61 at lambda 0.1, 0.91 at lambda 1; stage 03 passes), but the residual carries little:
+
+| lambda | residual top-1 L->C / C->L | after M4 | mQTL OR / negative-set OR (top 5%) |
+|---|---|---|---|
+| 0.1 within | 0.065 / 0.052 | 0.033 / 0.007 | 1.55 / 6.26 |
+| 1 within | 0.039 / 0.052 | 0.033 / 0.033 | 1.56 / 4.81 |
+
+## Task 9: beta-space ladder (PREREG amendment A1, jobs 43253-43264, `outputs/decision_beta.json`)
+
+Thresholds approved by the user before submission. All 12 CPU jobs `SANITY_OK`.
+
+| Rung | Result | Numbers |
+|---|---|---|
+| B1 | FAIL | rel. MSE reduction 0.038 (needs 0.10) |
+| B2 | FAIL (comparator only) | top-1 0.745 / 0.830, perm p 0.0001; R - (Z - tissue mean) 0.007 [-0.013, 0.033] and 0.013 [-0.020, 0.046] |
+| B3 | PASS | after full covariates 0.719 / 0.719; 129 donors sharing neither plate nor chip 0.729 / 0.736 |
+| B4 | FAIL | variance-matched mQTL OR 0.946 [0.926, 0.967]; negative set OR 1.153 [1.105, 1.203] |
+| B4c | pass (B4 fails overall) | median rho lung vs colon: mQTL 0.600 vs control 0.082, MW p 1.7e-59; raw betas 0.731 vs 0.032 |
+| B5 | PASS | Spearman rho 0.193, p 0.002 over 278 blocks |
+| B6 | PASS | struct keeps 100% |
+| Leakage | UNMASKED EXCESS | +0.026 [0.007, 0.052] lung->colon, 0.000 colon->lung |
+
+The printed interpretation in that run ("do not identify donors") was misleading; `10_decide.py` now says when
+rung 2 fails on its comparator only. Reading: a strong donor signal in tissue-centred betas, not batch, partly
+from SNP-affected probes, genetic at the strongest mQTL CpGs (B4c, B5) but not mQTL-specific site by site; the
+predictor's residual adds nothing over tissue-centring.
+
+## Task 10: reconstruction test (stage 11, job 44115; 8cc84d4)
+
+y_hat = z_B . w_i for each run at the 200 strongest mQTL CpGs and variance-matched controls, 153 test donors.
+(Job 43572 was cancelled by uid 0 after an hour pending, never started; resubmitted.)
+
+| Representation | Concordance mQTL / control | Fidelity, lung, mQTL / control | Matching L->C, 200 mQTL sites |
+|---|---|---|---|
+| raw betas | 0.73 / 0.03 | - | 1.00 (controls 0.05) |
+| beta-space PCA | 0.56 / 0.05 | 0.89 / 0.76 | 0.97 |
+| CpGPT small | 0.11 / 0.12 | 0.16 / 0.36 | 0.01 |
+| Perceiver large | 0.09 / 0.04 | 0.29 / 0.59 | 0.12 |
+| LeWM lambda 1 within | 0.05 / 0.06 | 0.11 / 0.28 | 0.05 |
+
+CpGPT's reconstructions keep no mQTL-vs-control concordance gap and track mQTL sites worse than controls.
+
+## Task 11: genotype fingerprint (stage 12, job 45167; 45239bd)
+
+SNP annotation: Zhou et al. EPIC hg38 common-SNP table (InfiniumAnnotationV1 `Anno/EPIC/EPIC.hg38.commonsnp.tsv.gz`,
+in `data/annotations/snp_dl/`), MAF >= 1% globally or in Europeans. 20% of block sites and 38% of the top 200
+mQTL CpGs overlap a common SNP.
+
+- **SNP-free sites.** Raw-beta concordance 0.71 / 0.04; lung->colon top-1 at 200 sites 1.00 (controls 0.03).
+- **Fingerprint size (SNP-free, L->C).** 5 sites 0.47, 10 sites 0.67, 20 sites 0.87, 50 sites 0.99; controls 0.01-0.03.
+- **Tissue pairs.** All 20 ordered pairs with >= 20 shared test donors match at 0.88-1.00 on SNP-free sites
+  (testis pairs lowest, 24 donors).
+- **Cluster shape (raw betas).** SNP-free mQTL sites prefer 3 components at 55% (lung) / 39% (colon) of sites;
+  lung-vs-colon spread difference 0.057 (SNP probes 0.033): SNP probes are a little more tissue-invariant.
+- **Whole-sample embedding.** CpGPT `Z_full` reconstructions: concordance 0.14 / 0.14, matching 0.01-0.03 at
+  every size. Perceiver `Z_full` also at chance. Per-block PCA keeps 0.96.
+
+**Conclusion.** The eGTEx betas carry a genotype fingerprint (20 SNP-free mQTL CpGs re-identify 87% of donors
+across tissues). Frozen CpGPT, block-wise or whole-sample, discards it, and so do the Perceivers and LeWM; a
+linear per-block PCA keeps it. The JEPA residual adds nothing on any representation.
